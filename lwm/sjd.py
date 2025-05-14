@@ -157,6 +157,92 @@ def get_multi_token_for_preparation(
         
         return rand_tokens, rand_tokens_scores
 
+def get_multi_token_for_preparation_jax(
+    rand_token_num, #窗口大小
+    candidate_ids, #已有的token, 固定的大小, (2, 385) 往里面填东西
+    candidate_probs, #已有的probs, 固定的大小, (2, 385, :) 往里面填东西
+    input_ids_len,
+    img_width = 16,
+    multi_token_init_scheme=None, #初始化方案, horizon or vertical
+    prefill_num = 0,#prompt
+    unmatched_tokens=None, #待拼接token, 可能是最新的那一个token, 是上次的没有match到token
+    unmatched_probs=None, # the same
+    eps = 1e-7, # igorne it
+    additional_tokens_len = 0,
+):
+    # 1.1 Init more, change the prefill_num
+    pad_len = 0 # pad_len = right_above
+    img_width = img_width + pad_len if img_width is not None else 0
+    
+    # 2. if there exist input_ids to cat
+    if (img_width > 0) and (rand_token_num > 0):
+        
+        # TODO: check the indices [unmatch]
+        horizon_indices = (jnp.arange(
+            input_ids_len + additional_tokens_len, 
+            input_ids_len + additional_tokens_len + rand_token_num, 
+            dtype=jnp.int32
+        ) - prefill_num) % img_width
+        vertical_indices = (jnp.arange(
+            input_ids_len + additional_tokens_len, 
+            input_ids_len + additional_tokens_len + rand_token_num, 
+            dtype=jnp.int32
+        ) - prefill_num) // img_width
+
+        # inition plan only horizon now
+        # horizon case
+        if 'horizon' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices
+            last_horizon_indices = horizon_indices - rand_token_num
+        elif 'vertical' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices - 1
+            last_horizon_indices = horizon_indices
+        elif 'random' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices
+            last_horizon_indices = horizon_indices
+        else:
+            assert False, f"multi_token_init_scheme should be 'horizon' 'random' or 'vertical', but got {multi_token_init_scheme}"
+        
+        # 填充操作 把上一时刻没有match的token加到候选项
+        last_candidate_tokens = lax.dynamic_update_slice(
+            candidate_ids, unmatched_tokens, 
+            (0, input_ids_len + additional_tokens_len)
+            ) if unmatched_tokens.shape[1] >0 else candidate_ids
+        last_candidate_probs = lax.dynamic_update_slice(
+            candidate_probs, unmatched_probs, 
+            (0, input_ids_len + additional_tokens_len, 0)
+            ) if unmatched_probs.shape[1] >0 else candidate_probs
+
+        # 一维的索引值 可能是空的, 可能是非空的. 如果是非空的, 就采取某种策略去做token的选取
+        last_flatten_indices = last_vertical_indices * img_width + last_horizon_indices + prefill_num
+        # e.g., last indices [100, 101, 102], but the current indices up to 100, 
+        # and 101, 102 depends on the values from 100 (but 100 has not been appended to input-ids yet)
+        last_flatten_indices = jnp.clip(last_flatten_indices, a_min=0, a_max=last_candidate_tokens.shape[1] - 1)
+        
+        # Repeat的token以及logits last_input_tokens-->(2, rand_token_num)
+        last_resampled_input_tokens = last_candidate_tokens[:, last_flatten_indices]
+        last_resampled_input_probs = last_candidate_probs[:, last_flatten_indices]
+        last_resampled_input_logits = jnp.log(last_resampled_input_probs.astype(jnp.float32) + eps)
+
+        # Transform plan
+        if 'sample' in multi_token_init_scheme:
+            resampled_rand_tokens, resampled_rand_probs = random_multinomial_sample_from_logits(
+                last_resampled_input_logits
+            ) # TODO: jax format need to change
+            rand_tokens = resampled_rand_tokens
+            rand_probs = resampled_rand_probs
+            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int].set(0.0)#重新设置索引值
+            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int, resampled_rand_tokens[0]].set(1.0)
+        elif 'repeat' in multi_token_init_scheme:
+            rand_tokens = last_resampled_input_tokens
+            rand_probs = last_resampled_input_probs
+        else:
+            assert False, f"multi_token_init_scheme should be 'sample' or 'repeat', but got {multi_token_init_scheme}"
+
+        unmatched_tokens = jnp.concatenate([unmatched_tokens, rand_tokens],axis=1) if unmatched_tokens.shape[1] >0 else rand_tokens
+        unmatched_probs = jnp.concatenate([unmatched_probs, rand_probs],axis=1) if unmatched_probs.shape[1] >0 else rand_probs
+    return unmatched_tokens, unmatched_probs
+
 # Verify
 import jax
 import jax.numpy as jnp
@@ -261,8 +347,8 @@ class SpeculativeSampler:
             next_token_index_selector = self.next_token_index_selector
 
             def scan_body(i, loop_carry):
-                next_tokens_i, next_scores_i, misaligned_idx, key_i, reject_flag = loop_carry
-                if reject_flag: #break 语句
+                next_tokens_i, next_probs_i, misaligned_idx, key_i, reject_flag = loop_carry
+                if reject_flag == True: #break 语句
                     return loop_carry
                 draft_token_index = draft_token_index_selector(i)
                 target_token_index = next_token_index_selector(i)
@@ -277,7 +363,7 @@ class SpeculativeSampler:
                 def accept_fn(key_i):
                     return (
                         next_tokens_i.at[b, target_token_index].set(cls_idx),
-                        next_scores_i.at[b, target_token_index].set(draft_prob[b, draft_token_index]),
+                        next_probs_i.at[b, target_token_index].set(draft_prob[b, draft_token_index]),
                         misaligned_idx,
                         key_i,
                         False
@@ -300,7 +386,7 @@ class SpeculativeSampler:
 
                     return (#这里理论上不该改变target的分布的, 但是根据公式, 其要改变.
                         next_tokens_i.at[b, target_token_index].set(resampled_tokens),
-                        next_scores_i.at[b, target_token_index].set(resampled_scores),
+                        next_probs_i.at[b, target_token_index].set(resampled_scores),
                         i,
                         key_i,
                         True
@@ -370,16 +456,16 @@ def prefix_matching_next_tokens(
         )
         return match_index, next_tokens, next_probs
     
-    def sampler_path(input_tokens, next_tokens, input_probs, next_token_scores):
+    def sampler_path(input_tokens, next_tokens, input_probs, next_token_probs):
         """Handle case when prefix_token_sampler is provided."""
-        match_index, next_tokens, next_token_scores = prefix_token_sampler(
+        match_index, next_tokens, next_token_probs = prefix_token_sampler(
             draft_tokens=input_tokens,
             next_tokens=next_tokens,
             draft_prob=input_probs,
-            next_prob=next_token_scores,
+            next_prob=next_token_probs,
             **kwargs
         )
-        return match_index, next_tokens, next_token_scores
+        return match_index, next_tokens, next_token_probs
     
     # Conditionally execute based on whether prefix_token_sampler is provided
     accept_index, next_tokens, next_probs = lax.cond(
@@ -392,15 +478,15 @@ def prefix_matching_next_tokens(
     acceptance_length = accept_index + 1
     matched_next_tokens = next_tokens[:, :acceptance_length]
     unmatched_next_tokens = next_tokens[:, acceptance_length:]
-    matched_next_scores = next_probs[:, :acceptance_length]
-    unmatched_next_scores = next_probs[:, acceptance_length:]
+    matched_next_probs = next_probs[:, :acceptance_length]
+    unmatched_next_probs = next_probs[:, acceptance_length:]
     
     return (
         acceptance_length,
         matched_next_tokens,
         unmatched_next_tokens,
-        matched_next_scores,
-        unmatched_next_scores
+        matched_next_probs,
+        unmatched_next_probs
     )
 
 # For adapt
