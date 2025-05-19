@@ -56,8 +56,10 @@ def main(argv):
     tokens_per_frame = 257
     vqgan = VQGAN(FLAGS.vqgan_checkpoint, replicate=False)
     mesh = VideoLLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
-    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
-    prefix_tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer, truncation_side='left', padding_side='left')
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer, local_files_only=True, legacy=False)
+    prefix_tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer, truncation_side='left', padding_side='left', legacy=False)
+    tokenizer.pad_token_id = 0
+    prefix_tokenizer.pad_token_id = 0
     if FLAGS.load_llama_config != '':
         llama_config = VideoLLaMAConfig.load_config(FLAGS.load_llama_config)
         updates = VideoLLaMAConfig(**FLAGS.llama)
@@ -86,6 +88,30 @@ def main(argv):
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
+        # from flax.core import freeze, unfreeze
+        # params = unfreeze(params)
+        # scan_decoder = params['params']['transformer']['h']['scan_decoder']
+        # # 裁剪 attention 参数
+        # for key in scan_decoder['attention']:
+        #     if scan_decoder['attention'][key]['kernel'].shape[0] == 32:
+        #         scan_decoder['attention'][key]['kernel'] = scan_decoder['attention'][key]['kernel'][0:1]
+        
+        # # 裁剪其他 scan_decoder 参数（attention_norm, feed_forward, ffn_norm）
+        # for section in ['attention_norm', 'feed_forward', 'ffn_norm']:
+        #     if section in ['attention_norm','ffn_norm']:
+        #         if scan_decoder[section]['kernel'].shape[0] == 32:
+        #             scan_decoder[section]['kernel'] = scan_decoder[section]['kernel'][0:1]
+        #     else:
+        #         for key in scan_decoder[section]:
+        #             if scan_decoder[section][key]['kernel'].shape[0] == 32:
+        #                 scan_decoder[section][key]['kernel'] = scan_decoder[section][key]['kernel'][0:1]
+        
+        # params['params']['transformer']['h']['scan_decoder'] = scan_decoder
+        
+        # # 转换为 jax.Array
+        # params = jax.tree_util.tree_map(jnp.asarray, params)
+        # params = freeze(params)
+        # llama_config.num_hidden_layers=1
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,
             input_shape=(512, 8192),
@@ -155,12 +181,13 @@ def main(argv):
                 tokens_per_frame, FLAGS.cfg_scale_image,
                 FLAGS.top_k_image, FLAGS.temperature_image
             )
-            output = jax.device_get(output)
-            output = np.split(output, 2, axis=0)[0]
+            output_bio = jax.device_get(output)
+            output = np.split(output_bio, 2, axis=0)[0]
+            acceptance_length_list = np.split(output_bio, 2, axis=0)[1]
         output = output.reshape(len(prompts) // 2, tokens_per_frame)
         image = vqgan.decode(output[:, :-1].reshape(-1, 16, 16))
         image = ((jax.device_get(image) + 1) * 127.5).astype(np.uint8)
-        return output, image
+        return output, image, acceptance_length_list
 
     sharded_rng = next_rng()
     prompts = [FLAGS.prompt]
@@ -172,11 +199,13 @@ def main(argv):
         })
 
     B = 1
+    all_acceptance_length_list = []
     images, image_encodings = [], []
     for i in tqdm(list(range(0, len(entries), B))):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
-        img_enc, img = generate_first_frame(prompts, max_input_length=128)
+        img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
+        all_acceptance_length_list.append(acceptance_length_list)
         image_encodings.extend(img_enc)
         images.extend(img)
 
@@ -212,8 +241,9 @@ def main(argv):
                 (FLAGS.n_frames - 1) * tokens_per_frame, FLAGS.cfg_scale_video,
                 FLAGS.top_k_video, FLAGS.temperature_video
             )
-            output = jax.device_get(output)
-            output = np.split(output, 2, axis=0)[0]
+            output_bio = jax.device_get(output)
+            output = np.split(output_bio, 2, axis=0)[0]
+            acceptance_length_list = np.split(output_bio, 2, axis=0)[1]
         output = output.reshape(len(prompts) // 2, FLAGS.n_frames - 1, tokens_per_frame)
         output = np.concatenate([images[:len(prompts) // 2, None], output], axis=1)
         output = output[:, :, :-1].reshape(-1, FLAGS.n_frames, 16, 16)
@@ -222,7 +252,7 @@ def main(argv):
             v = vqgan.decode(v)
             v = ((jax.device_get(v) + 1) * 127.5).astype(np.uint8)
             vision.append(v)
-        return vision
+        return vision, acceptance_length_list
 
     new_entries = []
     for img_enc, entry in zip(image_encodings, entries):
@@ -239,8 +269,11 @@ def main(argv):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
         images = np.array([entry['image'] for entry in entries_i], dtype=np.int32)
-        videos.extend(generate_video_pred(prompts, images, max_input_length=128))
+        video, acceptance_length_list = generate_video_pred(prompts, images, max_input_length=128)
+        all_acceptance_length_list.append(acceptance_length_list)
+        videos.extend(video)
 
+    print(len(all_acceptance_length_list)) # jnp.count_nonzero(acceptance_length_list)获取非0元素数量
     video = videos[0]
     writer = imageio.get_writer(FLAGS.output_file, fps=4)
     for frame in video:

@@ -13,17 +13,32 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
-from transformers.generation.flax_utils import SampleState, FlaxLogitsProcessorList, FlaxSampleOutput, logger
+from transformers.generation.flax_utils import FlaxLogitsProcessorList, FlaxSampleOutput, logger
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from transformers import GenerationConfig
 
 from tux import load_pickle, open_file
 from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
-
+import numpy as np
+from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, init_array
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS
 
-
+import flax
+@flax.struct.dataclass
+class SampleState:
+    cur_len: int
+    sequences: jnp.ndarray
+    running_token: jnp.ndarray
+    running_probs: jnp.ndarray
+    is_sent_finished: jnp.ndarray
+    prng_key: jnp.ndarray
+    model_kwargs: Dict[str, jnp.ndarray]
+    acceptance_length_list: jnp.ndarray
+    rand_token_num: int = 0
+    acceptance_length: jnp.ndarray = jnp.array(1)
+    candidate_sequences: jnp.ndarray=jnp.empty((0,), dtype=jnp.int32)
+    candidate_probs: jnp.ndarray=jnp.empty((0,), dtype=jnp.int32)
 class VideoLLaMAConfig(LLaMAConfig):
     model_type = "video_llama"
 
@@ -465,12 +480,24 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             "vision_masks": vision_masks
         }
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+    def update_inputs_for_generation(self, model_outputs, model_kwargs, cur_len, rand_token_num, acceptance_length=1):
+        accept_kv_index = cur_len + acceptance_length - 1
+        model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'] = jnp.array([accept_kv_index], dtype=jnp.int32)
+        # 2. Init the mask and position. (attention_mask do not need to modify, because it is given length)
+        # 2.1 new_position_ids
+        # acceptance_position_ids = model_kwargs['position_ids'][:, -rand_token_num-2+acceptance_length:-rand_token_num+acceptance_length-1]
+        batch_size, seq_len = model_kwargs['position_ids'].shape
+        acceptance_position_ids = jax.lax.dynamic_slice(model_kwargs['position_ids'], (0,seq_len-rand_token_num-2+acceptance_length), (batch_size,1))
+        new_position_ids = acceptance_position_ids + jnp.arange(1, 2+rand_token_num, dtype=jnp.int32)[None, :]
+        # 2.2 new_mask
+        sub_vision_masks = np.full((model_kwargs["vision_masks"].shape[0], rand_token_num), True, dtype=bool)
+        new_vision_masks = jnp.concatenate([model_kwargs["vision_masks"][:, -1:], sub_vision_masks], axis=1)
+
         return {
             "past_key_values":  model_outputs.past_key_values,
-            "position_ids": model_kwargs["position_ids"][:, -1:] + 1,
+            "position_ids": new_position_ids,
             "attention_mask": model_kwargs["attention_mask"],
-            "vision_masks": model_kwargs["vision_masks"]
+            "vision_masks": new_vision_masks
         }
 
     def _sample_vision(
@@ -504,6 +531,21 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
 
+        rand_token_num = 2
+        img_vocab_size = 8448
+        # 用于预填充的random
+        pad_input_ids, pad_input_probs = init_array(rand_token_num, img_vocab_size)
+        pad_input_ids = jnp.concatenate([pad_input_ids, pad_input_ids], axis=0)
+        
+        input_probs = jnp.zeros((1, input_ids.shape[1], img_vocab_size), dtype=jnp.float32)
+        
+        input_ids = jnp.concatenate([input_ids, pad_input_ids], axis=-1)
+        input_probs = jnp.concatenate([input_probs, pad_input_probs], axis=1)
+
+        # candidate_sequences是用于复制的token
+        candidate_sequences, candidate_probs = init_array(max_length, img_vocab_size)
+        candidate_sequences = jnp.concatenate([candidate_sequences, candidate_sequences], axis=0)
+
         # per batch-item state bit indicating if sentence has finished.
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
@@ -514,15 +556,101 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         # initialize model specific kwargs
         model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length, **model_kwargs)
 
+        # 2. Init the mask and position. (attention_mask do not need to modify, because it is given length)
+        # 2.1 new_position_ids
+        valid_lengths = model_kwargs['position_ids'][:, -1:]
+        updated_position_ids = valid_lengths + jnp.arange(1, 1+rand_token_num, dtype=jnp.int32)[None, :]
+        new_position_ids = jnp.concatenate([model_kwargs["position_ids"], updated_position_ids], axis=1)
+        assert new_position_ids.shape[-1] == input_ids.shape[-1]
+        # 2.2 new_mask
+        sub_vision_masks = np.full((batch_size, rand_token_num), True, dtype=bool)
+        new_vision_masks = jnp.concatenate([model_kwargs["vision_masks"], sub_vision_masks], axis=1)
+        assert new_vision_masks.shape[-1] == input_ids.shape[-1]
+        # limit
+        # assert (jnp.max(new_position_ids, axis=1) <= jnp.sum(state.model_kwargs["attention_mask"] > 0, axis = -1)).min()
+        model_kwargs = {
+            "past_key_values":  model_kwargs["past_key_values"],
+            "position_ids": new_position_ids,
+            "attention_mask": model_kwargs["attention_mask"],
+            "vision_masks": new_vision_masks
+        }
+        acceptance_length_list = jnp.empty((max_length), dtype=jnp.int32)
+
         # initialize state
         state = SampleState(
             cur_len=cur_len,
             sequences=sequences,
             running_token=input_ids,
+            running_probs=input_probs,
             is_sent_finished=is_sent_finished,
             prng_key=prng_key,
             model_kwargs=model_kwargs,
+            acceptance_length=jnp.array(rand_token_num+1),
+            acceptance_length_list = acceptance_length_list,
+            candidate_sequences=candidate_sequences,
+            candidate_probs=candidate_probs,
+            rand_token_num=rand_token_num,
         )
+
+        prefix_token_sampler_scheme = 'jacobi'
+        prefix_token_sampler_scheme = 'speculative_jacobi'
+        if prefix_token_sampler_scheme == 'speculative_jacobi':
+            prefix_token_sampler = SpeculativeSampler(
+                generator=prng_key,  # 假设 self.generator 已是一个 JAX PRNGKey
+                sampling_last_draft_token=jnp.zeros(1),  # 使用 jnp.zeros，并移除多余的逗号
+            )
+        elif prefix_token_sampler_scheme == 'jacobi':
+            prefix_token_sampler = None
+        else:
+            raise ValueError(f"prefix_token_sampler_scheme: {self.prefix_token_sampler_scheme}")
+
+        def prefill_inputtoken(state, prefill_way):
+            if prefill_way in ["base"]:
+                print("base")
+                return SampleState(
+                    cur_len=state.cur_len,
+                    sequences=state.sequences,
+                    running_token=state.running_token,
+                    is_sent_finished=state.is_sent_finished,
+                    model_kwargs=state.model_kwargs,
+                    prng_key=state.prng_key,
+                    rand_token_num=state.rand_token_num,
+                )
+            elif prefill_way in ["sjd"]:
+                rand_token_num=2 #窗口大小
+                multi_token_init_scheme='repeat_horizon' #初始化方案, horizon or vertical
+                multi_token_init_scheme='repeat_vertical' #初始化方案, horizon or vertical
+                # multi_token_init_scheme='random' #初始化方案, horizon or vertical
+
+                # 1. Init the token and logits. prill to the running_token
+                running_token, running_probs = get_multi_token_for_preparation(rand_token_num=rand_token_num,
+                                                                                acceptance_length=state.acceptance_length,
+                                                                                input_ids=state.running_token,
+                                                                                input_probs=state.running_probs,
+                                                                                candidate_ids=state.candidate_sequences,
+                                                                                candidate_probs=state.candidate_probs,
+                                                                                input_ids_len=state.cur_len,
+                                                                                multi_token_init_scheme=multi_token_init_scheme,
+                                                                                prefill_num = initial_len)
+                print("sjd")
+                return SampleState(
+                    cur_len=state.cur_len,
+                    model_kwargs=state.model_kwargs,
+                    running_token=running_token,
+                    running_probs=running_probs,
+                    sequences=state.sequences,
+                    is_sent_finished=state.is_sent_finished,
+                    prng_key=state.prng_key,
+                    rand_token_num=rand_token_num,
+                    candidate_sequences = state.candidate_sequences,
+                    candidate_probs = state.candidate_probs,
+                    acceptance_length_list = state.acceptance_length_list,
+                    acceptance_length = state.acceptance_length,
+                )
+            elif prefill_way in ["fsjd"]:
+                print("fsjd")
+            else:
+                assert False, f"prefill_way should be 'base' 'fsjd' 'sjd', but got {prefill_way}"
 
         def sample_search_cond_fn(state):
             """state termination condition fn."""
@@ -534,39 +662,77 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         def sample_search_body_fn(state):
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
+            # 1. Phase: prefill token in it. 3-Way: Base, SJD, FSJD
+            state = prefill_inputtoken(state, prefill_way = "sjd")
             model_outputs = model(state.running_token, params=params, **state.model_kwargs)
 
-            logits = model_outputs.logits[:, -1]
-            cond_logits, uncond_logits = jnp.split(logits, 2, axis=0)
-            logits = uncond_logits + cfg_scales[:, None] * (cond_logits - uncond_logits)
+            # 1.1 Get the logits: 
+            # logits = model_outputs.logits[:, -1] #(2, len, 8448) len is len(state.running_token)
+            logits = model_outputs.logits[:, -state.rand_token_num-1:] #(2, rand_token_num+1, 8448) len is len(state.running_token)
+            cond_logits, uncond_logits = jnp.split(logits, 2, axis=0) #(1, rand_token_num+1, 8448)
+            logits = uncond_logits + cfg_scales[:, None, None] * (cond_logits - uncond_logits)
+            logits = logits[0] # (1, rand_token_num, dim) --> (rand_token_num+1, dim)
 
             # apply min_length, ...
             logits = logits_processor(state.sequences, logits, state.cur_len)
             # apply top_p, top_k, temperature
             logits = logits_warper(logits, logits, state.cur_len)
 
-            next_token = jax.random.categorical(prng_key, logits, axis=-1)
-            next_token = jax.lax.cond(
-                (state.cur_len - initial_len + 1) % 257 == 0,
-                lambda: jnp.full_like(next_token, 8192),
-                lambda: next_token
+            next_token = jax.random.categorical(prng_key, logits, axis=-1)[None] # (1, 1 + rand_token_num)
+            # 2. Verify & Accept prng_key是随机数
+            next_token_probs = jax.nn.softmax(logits, axis=-1)[None]
+            acceptance_length, matched_next_tokens, unmatched_next_tokens, \
+            matched_next_probs, unmatched_next_probs = prefix_matching_next_tokens(
+                    input_tokens=state.running_token[:1,-state.rand_token_num-1:],
+                    input_probs = state.running_probs[:,-state.rand_token_num-1:],
+                    next_tokens=next_token,
+                    next_probs=next_token_probs,
+                    logits_processor = logits_processor, 
+                    logits_warper = logits_warper,
+                    all_collected_input_ids = state.sequences,
+                    prefix_token_sampler = prefix_token_sampler
+                )
+            
+            # 3. Update and Judge stop signal: Split with 8192
+            start_position = state.cur_len - initial_len + 1
+            positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
+            position_check = jax.lax.dynamic_slice(positon_indices, (start_position,), (matched_next_tokens.shape[1],)) % 257
+            # position_check = jnp.arange(start_position, start_position + matched_next_tokens.shape[1] + 1, dtype=jnp.int32) % 257
+            matched_next_tokens = jax.lax.cond(
+                position_check.min() == 0,
+                lambda: matched_next_tokens.at[:, position_check.argmin()].set(8192),
+                lambda: matched_next_tokens
             )
-            next_token = jnp.concatenate([next_token, next_token], axis=0)
+            # next_token = jax.lax.cond(
+            #     (state.cur_len - initial_len + 1) % 257 == 0,
+            #     lambda: jnp.full_like(next_token, 8192),
+            #     lambda: next_token
+            # )
+            next_token = jnp.concatenate([matched_next_tokens, matched_next_tokens], axis=0)
+            unmatched_next_tokens = jnp.concatenate([unmatched_next_tokens, unmatched_next_tokens], axis=0)
 
-            #next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
-            next_token = next_token[:, None]
+            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id).max()
 
+            # Update 接受的token相关attribute
             next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
+            next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
+            next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
+            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs, state.cur_len, state.rand_token_num, acceptance_length)
 
+            acceptance_length_list = lax.dynamic_update_slice(state.acceptance_length_list, acceptance_length[None], (state.cur_len,))
             return SampleState(
-                cur_len=state.cur_len + 1,
+                cur_len=state.cur_len + acceptance_length,
                 sequences=next_sequences,
-                running_token=next_token,
+                running_token=unmatched_next_tokens,
+                running_probs=unmatched_next_probs,
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
                 prng_key=prng_key_next,
+                rand_token_num=rand_token_num,
+                candidate_sequences = next_candidate_sequences,
+                candidate_probs = next_candidate_probs,
+                acceptance_length = acceptance_length,
+                acceptance_length_list = acceptance_length_list
             )
 
         # The very first prompt often has sequence length > 1, so run outside of `lax.while_loop` to comply with TPU
@@ -578,7 +744,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         else:
             state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
 
-        return FlaxSampleOutput(sequences=state.sequences)
+        sequences_result = jnp.concatenate([state.sequences[:1], state.acceptance_length_list[None]], axis=0)
+        return FlaxSampleOutput(sequences=sequences_result)
 
     def generate_vision(
         self,
