@@ -248,13 +248,13 @@ class SpeculativeSampler:
         # 三大记录矩阵, 全局变量
         resampled_next_tokens = next_tokens.copy()
         resampled_next_scores = next_prob.copy()
-        rejected_index_list = jnp.full((B,L), L-1, dtype=jnp.int32)
+        rejected_index_list = jnp.full((B,L), L, dtype=jnp.int32)
 
         def process_batch(b, b_carry):
             next_tokens_b, next_probs_b, rejected_index_list_b, key_b = b_carry
 
             # misaligned_idx 记录着last的拒绝的index, 一开始预期全部接受到最后一个位置
-            rejected_idx_b = L-1
+            rejected_idx_b = L
             def line_spective_sample(i, i_carry):
                 next_tokens_i, next_probs_i, rejected_index_list_i, rejected_idx_i, key_i = i_carry
                 draft_token_index = draft_token_index_selector(i)
@@ -323,19 +323,35 @@ class SpeculativeSampler:
             0, B, process_batch, (resampled_next_tokens, resampled_next_scores, rejected_index_list, key)
         )
 
-        # 一定是 [L-1, ...] 全都接受不会改变最小值L-1, 第一个被拒绝的就是那个应该被索引的地方. 为树状结构埋下伏笔
+        # 一定是 [L-1, ...] 全都接受不会改变最小值L-1, 第一个被拒绝的就是那个应该被索引的地方. 为树状结构埋下伏笔 max_rejected_idx=(1,...,L-1), 若都接受, 则为L
         max_rejected_idx = rejected_index_list.min(axis=-1).max(axis=0)
-        return max_rejected_idx-1, resampled_next_tokens, resampled_next_scores
+        return max_rejected_idx, resampled_next_tokens, resampled_next_scores
 
 def find_first_misaligned_token_inds(input_tokens, next_tokens):
     b=0
     accept_index = 0 # accept_index in next_tokens
-    for i in range(1, input_tokens.shape[0]):
-        if input_tokens[b, i] == next_tokens[b, i-1]:
-            accept_index = i
-        else:
-            pass
-    return accept_index
+    L = input_tokens.shape[1]
+    # for i in range(1, input_tokens.shape[1]):
+    #     if input_tokens[b, i] == next_tokens[b, i-1]:
+    #         accept_index = i
+    #     else:
+    #         pass
+    def greedy(i, accept_index):
+        def accept_fn(accept_index):
+            return i
+        def reject_fn(accept_index):
+            return accept_index
+        accept_index= jax.lax.cond(
+            input_tokens[b, i] == next_tokens[b, i-1],
+            accept_fn,
+            reject_fn,
+            accept_index
+        )
+        return accept_index
+    accept_index = jax.lax.fori_loop(
+        1, L, greedy, (accept_index)
+    )
+    return accept_index + 1
 
 def prefix_matching_next_tokens(
     input_tokens,
@@ -366,31 +382,31 @@ def prefix_matching_next_tokens(
     """
     def default_path():
         """Handle case when prefix_token_sampler is None."""
-        match_index = find_first_misaligned_token_inds(
+        reject_index = find_first_misaligned_token_inds(
             input_tokens, next_tokens
         )
-        return match_index, next_tokens, next_probs
+        return reject_index, next_tokens, next_probs
     
     def sampler_path(input_tokens, next_tokens, input_probs, next_token_probs):
         """Handle case when prefix_token_sampler is provided."""
-        match_index, next_tokens, next_token_probs = prefix_token_sampler(
+        reject_index, next_tokens, next_token_probs = prefix_token_sampler(
             draft_tokens=input_tokens,
             next_tokens=next_tokens,
             draft_prob=input_probs,
             next_prob=next_token_probs,
             **kwargs
         )
-        return match_index, next_tokens, next_token_probs
+        return reject_index, next_tokens, next_token_probs
     
     # Conditionally execute based on whether prefix_token_sampler is provided
-    accept_index, next_tokens, next_probs = lax.cond(
+    reject_index, next_tokens, next_probs = lax.cond(
         prefix_token_sampler is None,
         lambda: default_path(),
         lambda: sampler_path(input_tokens, next_tokens, input_probs, next_probs),
     )
     
     # Split tokens and scores based on matched_num
-    acceptance_length = accept_index + 1
+    acceptance_length = reject_index
     # return acceptance_length, next_tokens, next_probs
     B,L,D = next_probs.shape
     matched_next_tokens, matched_next_probs = init_array(L,D)
@@ -405,7 +421,7 @@ def prefix_matching_next_tokens(
         def unmatch(A1):
             matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A1
             # 空出index=0的位置给最新accept的token在unmatched_tokens, unmatched_probs中
-            j = i - acceptance_length
+            j = i - acceptance_length #j为不match的index
             unmatched_tokens = lax.dynamic_update_slice(unmatched_tokens, next_tokens[:, i][None], (0, j+1))
             unmatched_probs = lax.dynamic_update_slice(unmatched_probs, next_probs[:, i][None], (0, j+1, 0))
             return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs

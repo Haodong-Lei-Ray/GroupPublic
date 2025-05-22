@@ -39,7 +39,17 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     llama=VideoLLaMAConfig.get_default_config(),
     jax_distributed=JaxDistributedConfig.get_default_config(),
 )
-
+def calculate_mean_nonzero(arrays):
+    # 将输入的数组列表合并为一个数组
+    combined_array = np.concatenate(arrays)
+    
+    # 提取非零元素
+    non_zero_elements = combined_array[combined_array != 0]
+    
+    # 计算非零元素的均值
+    mean_non_zero = np.mean(non_zero_elements)
+    
+    return mean_non_zero
 
 def main(argv):
     assert FLAGS.output_file != ''
@@ -88,30 +98,30 @@ def main(argv):
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
-        # from flax.core import freeze, unfreeze
-        # params = unfreeze(params)
-        # scan_decoder = params['params']['transformer']['h']['scan_decoder']
-        # # 裁剪 attention 参数
-        # for key in scan_decoder['attention']:
-        #     if scan_decoder['attention'][key]['kernel'].shape[0] == 32:
-        #         scan_decoder['attention'][key]['kernel'] = scan_decoder['attention'][key]['kernel'][0:1]
+        from flax.core import freeze, unfreeze
+        params = unfreeze(params)
+        scan_decoder = params['params']['transformer']['h']['scan_decoder']
+        # 裁剪 attention 参数
+        for key in scan_decoder['attention']:
+            if scan_decoder['attention'][key]['kernel'].shape[0] == 32:
+                scan_decoder['attention'][key]['kernel'] = scan_decoder['attention'][key]['kernel'][0:1]
         
-        # # 裁剪其他 scan_decoder 参数（attention_norm, feed_forward, ffn_norm）
-        # for section in ['attention_norm', 'feed_forward', 'ffn_norm']:
-        #     if section in ['attention_norm','ffn_norm']:
-        #         if scan_decoder[section]['kernel'].shape[0] == 32:
-        #             scan_decoder[section]['kernel'] = scan_decoder[section]['kernel'][0:1]
-        #     else:
-        #         for key in scan_decoder[section]:
-        #             if scan_decoder[section][key]['kernel'].shape[0] == 32:
-        #                 scan_decoder[section][key]['kernel'] = scan_decoder[section][key]['kernel'][0:1]
+        # 裁剪其他 scan_decoder 参数（attention_norm, feed_forward, ffn_norm）
+        for section in ['attention_norm', 'feed_forward', 'ffn_norm']:
+            if section in ['attention_norm','ffn_norm']:
+                if scan_decoder[section]['kernel'].shape[0] == 32:
+                    scan_decoder[section]['kernel'] = scan_decoder[section]['kernel'][0:1]
+            else:
+                for key in scan_decoder[section]:
+                    if scan_decoder[section][key]['kernel'].shape[0] == 32:
+                        scan_decoder[section][key]['kernel'] = scan_decoder[section][key]['kernel'][0:1]
         
-        # params['params']['transformer']['h']['scan_decoder'] = scan_decoder
+        params['params']['transformer']['h']['scan_decoder'] = scan_decoder
         
-        # # 转换为 jax.Array
-        # params = jax.tree_util.tree_map(jnp.asarray, params)
-        # params = freeze(params)
-        # llama_config.num_hidden_layers=1
+        # 转换为 jax.Array
+        params = jax.tree_util.tree_map(jnp.asarray, params)
+        params = freeze(params)
+        llama_config.num_hidden_layers=1
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,
             input_shape=(512, 8192),
@@ -274,6 +284,11 @@ def main(argv):
         videos.extend(video)
 
     print(len(all_acceptance_length_list)) # jnp.count_nonzero(acceptance_length_list)获取非0元素数量
+    print(all_acceptance_length_list)
+    import pickle
+    with open('/home/leihaodong/AAAI25/exp/LWMSJD/test/my_list.pkl', 'wb') as f:
+        pickle.dump(all_acceptance_length_list, f)
+    print(calculate_mean_nonzero(all_acceptance_length_list))
     video = videos[0]
     writer = imageio.get_writer(FLAGS.output_file, fps=4)
     for frame in video:
