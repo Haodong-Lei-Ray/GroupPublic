@@ -450,3 +450,76 @@ def prefix_matching_next_tokens(
     )
 
 # For adapt
+def debug(llama_config,params, layer=32, scan_layers=False,
+          max_sequence_length=2048):
+    # TODO:debug
+    llama_config.update(dict(
+        num_hidden_layers=layer,
+        scan_layers=scan_layers
+    ))
+    
+    llama_config.update(dict(
+            max_sequence_length=2048
+        ))
+    
+    
+    #NOTE:debug-->control layer
+    from flax.core import freeze, unfreeze
+    params = unfreeze(params)
+    scan_decoder = params['params']['transformer']['h']['scan_decoder']
+    # Trim all parameters in scan_decoder to match num_hidden_layers
+    for section in scan_decoder:
+        for key in scan_decoder[section]:
+            if isinstance(scan_decoder[section][key], dict) and 'kernel' in scan_decoder[section][key]:
+                kernel = scan_decoder[section][key]['kernel']
+                if kernel.shape[0] > layer:
+                    scan_decoder[section][key]['kernel'] = kernel[:layer]
+                elif kernel.shape[0] < layer:
+                    # Pad with zeros or repeat if necessary (optional, depending on your needs)
+                    raise ValueError(f"Parameter {section}/{key}/kernel has unexpected shape {kernel.shape}")
+            elif section in ['attention_norm', 'ffn_norm'] and 'kernel' in scan_decoder[section]:
+                kernel = scan_decoder[section]['kernel']
+                if kernel.shape[0] > layer:
+                    scan_decoder[section]['kernel'] = kernel[:layer]
+                elif kernel.shape[0] < layer:
+                    raise ValueError(f"Parameter {section}/kernel has unexpected shape {kernel.shape}")
+    #NOTE:scan_decoder模式取消# 假设 num_hidden_layers=2
+
+    if llama_config.scan_layers:
+        params['params']['transformer']['h']['scan_decoder'] = scan_decoder
+    else:# 假设 num_hidden_layers=2
+        new_h = {}
+        for layer_idx in range(layer):
+            layer_params = {}
+            # 处理 attention 参数
+            layer_params['attention'] = {}
+            for attn_key in ['wk', 'wo', 'wq', 'wv']:
+                if attn_key in scan_decoder['attention']:
+                    layer_params['attention'][attn_key] = {
+                        'kernel': scan_decoder['attention'][attn_key]['kernel'][layer_idx]
+                    }
+            # 处理 attention_norm
+            if 'attention_norm' in scan_decoder:
+                layer_params['attention_norm'] = {
+                    'kernel': scan_decoder['attention_norm']['kernel'][layer_idx]
+                }
+            # 处理 feed_forward 参数
+            layer_params['feed_forward'] = {}
+            for ffn_key in ['w1', 'w2', 'w3']:
+                if ffn_key in scan_decoder['feed_forward']:
+                    layer_params['feed_forward'][ffn_key] = {
+                        'kernel': scan_decoder['feed_forward'][ffn_key]['kernel'][layer_idx]
+                    }
+            # 处理 ffn_norm
+            if 'ffn_norm' in scan_decoder:
+                layer_params['ffn_norm'] = {
+                    'kernel': scan_decoder['ffn_norm']['kernel'][layer_idx]
+                }
+            new_h[str(layer_idx)] = layer_params
+        params['params']['transformer']['h'] = new_h
+    
+    # 转换为 jax.Array
+    # params = jax.tree_util.tree_map(jnp.asarray, params)
+    params = freeze(params)
+    #NOTE:end
+    return llama_config, params

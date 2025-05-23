@@ -16,6 +16,7 @@ from tux import (
 )
 from lwm.vision_llama import VideoLLaMAConfig, FlaxVideoLLaMAForCausalLM
 from lwm.vqgan import VQGAN
+from lwm.sjd import debug
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
@@ -87,49 +88,18 @@ def main(argv):
 
     if FLAGS.update_llama_config != '':
         llama_config.update(dict(eval(FLAGS.update_llama_config)))
-    # TODO:debug
-    llama_config.update(dict(
-            max_sequence_length=2048
-        ))
 
     llama_config.update(dict(
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
     ))
     llama_config.update(dict(mesh_dim=FLAGS.mesh_dim))
-    #NOTE:debug-->control layer
-    layer = 2
-    llama_config.update(dict(num_hidden_layers=layer))
 
     with jax.default_device(jax.devices("cpu")[0]):
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
-        #NOTE:debug-->control layer
-        from flax.core import freeze, unfreeze
-        params = unfreeze(params)
-        scan_decoder = params['params']['transformer']['h']['scan_decoder']
-        # 裁剪 attention 参数
-        for key in scan_decoder['attention']:
-            if scan_decoder['attention'][key]['kernel'].shape[0] == 32:
-                scan_decoder['attention'][key]['kernel'] = scan_decoder['attention'][key]['kernel'][0:layer]
-        
-        # 裁剪其他 scan_decoder 参数（attention_norm, feed_forward, ffn_norm）
-        for section in ['attention_norm', 'feed_forward', 'ffn_norm']:
-            if section in ['attention_norm','ffn_norm']:
-                if scan_decoder[section]['kernel'].shape[0] == 32:
-                    scan_decoder[section]['kernel'] = scan_decoder[section]['kernel'][0:layer]
-            else:
-                for key in scan_decoder[section]:
-                    if scan_decoder[section][key]['kernel'].shape[0] == 32:
-                        scan_decoder[section][key]['kernel'] = scan_decoder[section][key]['kernel'][0:layer]
-        
-        params['params']['transformer']['h']['scan_decoder'] = scan_decoder
-        
-        # 转换为 jax.Array
-        params = jax.tree_util.tree_map(jnp.asarray, params)
-        params = freeze(params)
-        #NOTE:end
+        # llama_config, params = debug(llama_config, params, layer=2, scan_layers=True)
         #NOTE:fix a bug input_shape=(512, 8192)-->input_shape=(256, llama_config.max_sequence_length)
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,

@@ -482,7 +482,14 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs, cur_len, rand_token_num, acceptance_length=1):
         accept_kv_index = cur_len + acceptance_length - 1
-        model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'] = jnp.array([accept_kv_index], dtype=jnp.int32)
+        if self.config.scan_layers:
+            cope_shape = model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'].shape
+            model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'] = jnp.full(cope_shape, accept_kv_index, dtype=jnp.int32)
+            jax.debug.print("Value of x: {x}", x=model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'])
+        else:
+            for i in range(len(model_outputs.past_key_values["transformer"]['h'])):
+                cope_shape = model_outputs.past_key_values["transformer"]['h'][str(i)]['attention']['cache_index'].shape
+                model_outputs.past_key_values["transformer"]['h'][str(i)]['attention']['cache_index'] = jnp.full(cope_shape, accept_kv_index, dtype=jnp.int32)
         # 2. Init the mask and position. (attention_mask do not need to modify, because it is given length)
         # 2.1 new_position_ids
         # acceptance_position_ids = model_kwargs['position_ids'][:, -rand_token_num-2+acceptance_length:-rand_token_num+acceptance_length-1]
@@ -654,7 +661,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
 
         def sample_search_cond_fn(state):
             """state termination condition fn."""
-            has_reached_max_length = state.cur_len == max_length
+            has_reached_max_length = state.cur_len >= max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
