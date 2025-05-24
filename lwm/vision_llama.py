@@ -20,7 +20,7 @@ from transformers import GenerationConfig
 from tux import load_pickle, open_file
 from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
 import numpy as np
-from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, init_array
+from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, get_update_window_token_FSJD, init_array
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS
 
@@ -35,7 +35,6 @@ class SampleState:
     prng_key: jnp.ndarray
     model_kwargs: Dict[str, jnp.ndarray]
     acceptance_length_list: jnp.ndarray
-    rand_token_num: int = 0
     acceptance_length: jnp.ndarray = jnp.array(1)
     candidate_sequences: jnp.ndarray=jnp.empty((0,), dtype=jnp.int32)
     candidate_probs: jnp.ndarray=jnp.empty((0,), dtype=jnp.int32)
@@ -485,7 +484,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         if self.config.scan_layers:
             cope_shape = model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'].shape
             model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'] = jnp.full(cope_shape, accept_kv_index, dtype=jnp.int32)
-            jax.debug.print("Value of x: {x}", x=model_outputs.past_key_values["transformer"]['h']['scan_decoder']['attention']['cache_index'])
         else:
             for i in range(len(model_outputs.past_key_values["transformer"]['h'])):
                 cope_shape = model_outputs.past_key_values["transformer"]['h'][str(i)]['attention']['cache_index'].shape
@@ -538,8 +536,12 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
 
-        rand_token_num = 2
-        img_vocab_size = 8448
+        # TODO:超参数修改点 "sjd" 8:1.58 16:1.60 32:2.01 64:1.77
+        rand_token_num = self.config.rand_token_num # 8
+        prefill_way = self.config.prefill_way # "sjd","fsjd"
+        prefix_token_sampler_scheme = self.config.prefix_token_sampler_scheme # 'jacobi','speculative_jacobi'
+        print(f"runing the generation with len: {self.config.rand_token_num} prefill: {self.config.prefill_way} verify: {self.config.prefix_token_sampler_scheme}")
+        img_vocab_size = self.config.vision_vocab_size
         # 用于预填充的random
         pad_input_ids, pad_input_probs = init_array(rand_token_num, img_vocab_size)
         pad_input_ids = jnp.concatenate([pad_input_ids, pad_input_ids], axis=0)
@@ -596,11 +598,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             acceptance_length_list = acceptance_length_list,
             candidate_sequences=candidate_sequences,
             candidate_probs=candidate_probs,
-            rand_token_num=rand_token_num,
         )
 
-        prefix_token_sampler_scheme = 'jacobi'
-        prefix_token_sampler_scheme = 'speculative_jacobi'
         if prefix_token_sampler_scheme == 'speculative_jacobi':
             prefix_token_sampler = SpeculativeSampler(
                 generator=prng_key,  # 假设 self.generator 已是一个 JAX PRNGKey
@@ -609,11 +608,10 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         elif prefix_token_sampler_scheme == 'jacobi':
             prefix_token_sampler = None
         else:
-            raise ValueError(f"prefix_token_sampler_scheme: {self.prefix_token_sampler_scheme}")
+            raise ValueError(f"prefix_token_sampler_scheme: {prefix_token_sampler_scheme}")
 
         def prefill_inputtoken(state, prefill_way):
             if prefill_way in ["base"]:
-                print("base")
                 return SampleState(
                     cur_len=state.cur_len,
                     sequences=state.sequences,
@@ -621,10 +619,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     is_sent_finished=state.is_sent_finished,
                     model_kwargs=state.model_kwargs,
                     prng_key=state.prng_key,
-                    rand_token_num=state.rand_token_num,
                 )
             elif prefill_way in ["sjd"]:
-                rand_token_num=2 #窗口大小
                 multi_token_init_scheme='repeat_horizon' #初始化方案, horizon or vertical
                 multi_token_init_scheme='repeat_vertical' #初始化方案, horizon or vertical
                 # multi_token_init_scheme='random' #初始化方案, horizon or vertical
@@ -639,7 +635,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                                                                                 input_ids_len=state.cur_len,
                                                                                 multi_token_init_scheme=multi_token_init_scheme,
                                                                                 prefill_num = initial_len)
-                print("sjd")
                 return SampleState(
                     cur_len=state.cur_len,
                     model_kwargs=state.model_kwargs,
@@ -648,19 +643,41 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     sequences=state.sequences,
                     is_sent_finished=state.is_sent_finished,
                     prng_key=state.prng_key,
-                    rand_token_num=rand_token_num,
                     candidate_sequences = state.candidate_sequences,
                     candidate_probs = state.candidate_probs,
                     acceptance_length_list = state.acceptance_length_list,
                     acceptance_length = state.acceptance_length,
                 )
             elif prefill_way in ["fsjd"]:
-                print("fsjd")
+                multi_token_init_scheme='repeat_random' #初始化方案, horizon or vertical
+                running_token, running_probs = get_update_window_token_FSJD(rand_token_num=rand_token_num,
+                                                                                acceptance_length=state.acceptance_length,
+                                                                                input_ids=state.running_token,
+                                                                                input_probs=state.running_probs,
+                                                                                candidate_ids=state.candidate_sequences,
+                                                                                candidate_probs=state.candidate_probs,
+                                                                                input_ids_len=state.cur_len,
+                                                                                multi_token_init_scheme=multi_token_init_scheme,
+                                                                                prefill_num = initial_len)
+                return SampleState(
+                    cur_len=state.cur_len,
+                    model_kwargs=state.model_kwargs,
+                    running_token=running_token,
+                    running_probs=running_probs,
+                    sequences=state.sequences,
+                    is_sent_finished=state.is_sent_finished,
+                    prng_key=state.prng_key,
+                    candidate_sequences = state.candidate_sequences,
+                    candidate_probs = state.candidate_probs,
+                    acceptance_length_list = state.acceptance_length_list,
+                    acceptance_length = state.acceptance_length,
+                )
             else:
                 assert False, f"prefill_way should be 'base' 'fsjd' 'sjd', but got {prefill_way}"
 
         def sample_search_cond_fn(state):
             """state termination condition fn."""
+            # jax.debug.print("Value of x: {x}", x=state.cur_len)
             has_reached_max_length = state.cur_len >= max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
@@ -670,12 +687,12 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
             # 1. Phase: prefill token in it. 3-Way: Base, SJD, FSJD
-            state = prefill_inputtoken(state, prefill_way = "sjd")
+            state = prefill_inputtoken(state, prefill_way = prefill_way)
             model_outputs = model(state.running_token, params=params, **state.model_kwargs)
 
             # 1.1 Get the logits: 
             # logits = model_outputs.logits[:, -1] #(2, len, 8448) len is len(state.running_token)
-            logits = model_outputs.logits[:, -state.rand_token_num-1:] #(2, rand_token_num+1, 8448) len is len(state.running_token)
+            logits = model_outputs.logits[:, -rand_token_num-1:] #(2, rand_token_num+1, 8448) len is len(state.running_token)
             cond_logits, uncond_logits = jnp.split(logits, 2, axis=0) #(1, rand_token_num+1, 8448)
             logits = uncond_logits + cfg_scales[:, None, None] * (cond_logits - uncond_logits)
             logits = logits[0] # (1, rand_token_num, dim) --> (rand_token_num+1, dim)
@@ -690,8 +707,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             next_token_probs = jax.nn.softmax(logits, axis=-1)[None]
             acceptance_length, matched_next_tokens, unmatched_next_tokens, \
             matched_next_probs, unmatched_next_probs = prefix_matching_next_tokens(
-                    input_tokens=state.running_token[:1,-state.rand_token_num-1:],
-                    input_probs = state.running_probs[:,-state.rand_token_num-1:],
+                    input_tokens=state.running_token[:1,-rand_token_num-1:],
+                    input_probs = state.running_probs[:,-rand_token_num-1:],
                     next_tokens=next_token,
                     next_probs=next_token_probs,
                     logits_processor = logits_processor, 
@@ -724,7 +741,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
             next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
             next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
-            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs, state.cur_len, state.rand_token_num, acceptance_length)
+            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs, state.cur_len, rand_token_num, acceptance_length)
 
             acceptance_length_list = lax.dynamic_update_slice(state.acceptance_length_list, acceptance_length[None], (state.cur_len,))
             return SampleState(
@@ -735,7 +752,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
                 prng_key=prng_key_next,
-                rand_token_num=rand_token_num,
                 candidate_sequences = next_candidate_sequences,
                 candidate_probs = next_candidate_probs,
                 acceptance_length = acceptance_length,

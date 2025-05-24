@@ -43,6 +43,7 @@ def random_multinomial_sample_from_logits(rand_logits, prng_key):
     return rand_tokens, probs
 
 # Prefill
+#NOTE: SJD
 def get_multi_token_for_preparation(
     rand_token_num, #窗口大小
     acceptance_length,
@@ -59,24 +60,12 @@ def get_multi_token_for_preparation(
     # 1.1 Init more, change the prefill_num
     pad_len = 0 # pad_len = right_above
     img_width = img_width + pad_len if img_width is not None else 0
-    # rand_token_num=2
-    # 2. if there exist input_ids to cat
-    if (img_width > 0) and (rand_token_num > 0):
+    if (img_width > 0) :
         positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
         positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
         # TODO: check the indices [unmatch]
         horizon_indices = positon_indices % img_width
         vertical_indices = positon_indices // img_width
-        # horizon_indices = (jnp.arange(
-        #     input_ids_len, 
-        #     input_ids_len + rand_token_num, 
-        #     dtype=jnp.int32
-        # ) - prefill_num) % img_width
-        # vertical_indices = (jnp.arange(
-        #     input_ids_len, 
-        #     input_ids_len + rand_token_num, 
-        #     dtype=jnp.int32
-        # ) - prefill_num) // img_width
 
         # inition plan only horizon now
         # horizon case
@@ -101,6 +90,96 @@ def get_multi_token_for_preparation(
             candidate_probs, input_probs[:,-rand_token_num:], 
             (0, input_ids_len, 0)
             )
+
+        # 一维的索引值 可能是空的, 可能是非空的. 如果是非空的, 就采取某种策略去做token的选取
+        # last_vertical_indices and last_horizon_indices is (2, rand_token_num)
+        last_flatten_indices = last_vertical_indices * img_width + last_horizon_indices + prefill_num
+        # e.g., last indices [100, 101, 102], but the current indices up to 100, 
+        # and 101, 102 depends on the values from 100 (but 100 has not been appended to input-ids yet)
+        last_flatten_indices = jnp.clip(last_flatten_indices, a_min=0, a_max=last_candidate_tokens.shape[1] - 1)
+        
+        # Repeat的token以及logits last_input_tokens-->(2, rand_token_num)
+        last_resampled_input_tokens = last_candidate_tokens[:, last_flatten_indices]
+        last_resampled_input_probs = last_candidate_probs[:, last_flatten_indices]
+        last_resampled_input_logits = jnp.log(last_resampled_input_probs.astype(jnp.float32) + eps)
+
+        # Transform plan
+        if 'sample' in multi_token_init_scheme:
+            resampled_rand_tokens, resampled_rand_probs = random_multinomial_sample_from_logits(
+                last_resampled_input_logits
+            ) # TODO: jax format need to change
+            rand_tokens = resampled_rand_tokens
+            rand_probs = resampled_rand_probs
+            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int].set(0.0)#重新设置索引值
+            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int, resampled_rand_tokens[0]].set(1.0)
+        elif 'repeat' in multi_token_init_scheme:
+            rand_tokens = last_resampled_input_tokens
+            rand_probs = last_resampled_input_probs
+        else:
+            assert False, f"multi_token_init_scheme should be 'sample' or 'repeat', but got {multi_token_init_scheme}"
+        def prefill_token_line(i, A):#做替换填充
+            # input_ids_i: (2, rand_token_num)
+            # last_resampled_input_logits: (2, rand_token_num)
+            input_ids_i, input_probs_i = A
+            input_ids_i = input_ids_i.at[:, i].set(rand_tokens[:,i])
+            input_probs_i = input_probs_i.at[:, i].set(rand_probs[:,i])
+            return input_ids_i, input_probs_i
+        input_ids, input_probs = jax.lax.fori_loop(
+            -(acceptance_length - 1), 0, prefill_token_line, (input_ids, input_probs)
+        )
+    
+    return input_ids, input_probs
+
+#NOTE: FSJD
+def get_update_window_token_FSJD(
+    rand_token_num, #窗口大小
+    acceptance_length,
+    input_ids,
+    input_probs,
+    candidate_ids, #已有的token, 固定的大小, (2, 385) 往里面填东西
+    candidate_probs, #已有的probs, 固定的大小, (2, 385, :) 往里面填东西
+    input_ids_len,
+    img_width = 16,
+    multi_token_init_scheme=None, #初始化方案, horizon or vertical
+    prefill_num = 0,#prompt
+    eps = 1e-7, # igorne it
+):
+    # 1.1 Init more, change the prefill_num
+    pad_len = 0 # pad_len = right_above
+    img_width = img_width + pad_len if img_width is not None else 0
+    # 2. if there exist input_ids to cat
+    if (img_width > 0) and (rand_token_num > 0):
+        positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
+        positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
+        # TODO: check the indices [unmatch]
+        horizon_indices = positon_indices % img_width
+        vertical_indices = positon_indices // img_width
+
+        # inition plan only horizon now
+        # horizon case
+        if 'horizon' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices
+            last_horizon_indices = horizon_indices - rand_token_num
+        elif 'vertical' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices - 1
+            last_horizon_indices = horizon_indices
+        elif 'random' in multi_token_init_scheme:
+            last_vertical_indices = vertical_indices
+            last_horizon_indices = horizon_indices
+        else:
+            assert False, f"multi_token_init_scheme should be 'horizon' 'random' or 'vertical', but got {multi_token_init_scheme}"
+        
+        # TODO: 似乎这样的更新存在一定的问题
+        last_candidate_tokens = candidate_ids
+        last_candidate_probs = candidate_probs
+        # last_candidate_tokens = lax.dynamic_update_slice(
+        #     candidate_ids, input_ids[:,-rand_token_num:], 
+        #     (0, input_ids_len)
+        #     )
+        # last_candidate_probs = lax.dynamic_update_slice(
+        #     candidate_probs, input_probs[:,-rand_token_num:], 
+        #     (0, input_ids_len, 0)
+        #     )
 
         # 一维的索引值 可能是空的, 可能是非空的. 如果是非空的, 就采取某种策略去做token的选取
         # last_vertical_indices and last_horizon_indices is (2, rand_token_num)
