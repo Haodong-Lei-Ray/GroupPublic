@@ -200,9 +200,8 @@ def main(argv):
         else:
             data = get_first_100_pairs(data[1:],len=FLAGS.eval_len)
         for i, row in enumerate(data):
-            if i!=0:
-                prompts.append(row[-1])
-                video_name.append(row[-2])
+            prompts.append(row[-1])
+            video_name.append(row[-2])
     else:
         prompts = [FLAGS.prompt]
     entries = []
@@ -222,10 +221,7 @@ def main(argv):
         prompts = [entry['prompt'] for entry in entries_i]
         print(f"No.{i} is {prompts}")
         st = time.time()
-        try:
-            img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
-        except Exception as e:
-            print(f"错误: {e}")
+        img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
         time_list_first.append(time.time() - st)
         first_acceptance_length_list.append(acceptance_length_list)
         image_encodings.extend(img_enc)
@@ -327,7 +323,7 @@ def main(argv):
         
         mean_accl_i = calculate_mean_nonzero(all_acceptance_length_list[i])
         new_entry = {
-            "prompt": entry[i]['caption'],
+            "prompt": entries[i]['caption'],
             "times": time_i,  # 转换为 Python float
             "acc_l": mean_accl_i,       # 转换为 Python float
         }
