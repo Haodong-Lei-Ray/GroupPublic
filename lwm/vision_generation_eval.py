@@ -16,13 +16,13 @@ from tux import (
 )
 from lwm.vision_llama import VideoLLaMAConfig, FlaxVideoLLaMAForCausalLM
 from lwm.vqgan import VQGAN
-from lwm.sjd import debug
+from lwm.sjd import debug,get_random_100_pairs,get_first_100_pairs
 import time
 import pickle
 import os
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
-    prompt='Fireworks over the city',
+    prompt='MSRVTT',#'VBench' 'MSRVTT'
     output_file='',
     temperature_image=1.0,
     temperature_video=1.0,
@@ -44,7 +44,10 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     # TODO: Update parameters of SJD
     rand_token_num=32,
     prefix_token_sampler_scheme='speculative_jacobi',
-    prefill_way="fsjd"
+    prefill_way="fsjd",
+    benchmark_path="/data/lei/dataset/MSRVTT", 
+    eval_len=2,
+    benchmark_way="order"
 )
 def calculate_mean_nonzero(combined_array):
     # 提取非零元素
@@ -57,12 +60,6 @@ def calculate_mean_nonzero(combined_array):
 
 def main(argv):
     assert FLAGS.output_file != ''
-    if FLAGS.output_file.endswith('mp4'):
-        assert FLAGS.n_frames > 1
-    elif FLAGS.output_file.endswith('png') or FLAGS.output_file.endswith('jpg'):
-        assert FLAGS.n_frames == 1
-    else:
-        raise ValueError(f"Unsupported output file extension: {FLAGS.output_file}")
 
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     set_random_seed(FLAGS.seed)
@@ -188,9 +185,26 @@ def main(argv):
         return output, image, acceptance_length_list
 
     sharded_rng = next_rng()
-    # FIXME: eval bug
-    prompts = [FLAGS.prompt]
-    ori_prompts = prompts
+    video_name = []
+    # ++++++++++++++++++++++++++Benchmark_init++++++++++++++++++++++++++
+    if FLAGS.prompt == 'MSRVTT':
+        import csv
+        data,prompts = [],[]
+        csvfile = f"{FLAGS.benchmark_path}/MSRVTT_JSFUSION_test.csv"
+        with open(csvfile, "r") as csvfile:
+            reader = csv.reader(csvfile)
+            for row in reader:
+                data.append(row)
+        if FLAGS.benchmark_way == 'random':
+            data = get_random_100_pairs(data[1:],len=FLAGS.eval_len)
+        else:
+            data = get_first_100_pairs(data[1:],len=FLAGS.eval_len)
+        for i, row in enumerate(data):
+            if i!=0:
+                prompts.append(row[-1])
+                video_name.append(row[-2])
+    else:
+        prompts = [FLAGS.prompt]
     entries = []
     for prompt in prompts:
         entries.append({
@@ -202,11 +216,16 @@ def main(argv):
     first_acceptance_length_list, later_acceptance_length_list = [],[]
     time_list_first, time_list_later = [],[]
     images, image_encodings = [], []
+    print("Begin generate First image")
     for i in tqdm(list(range(0, len(entries), B))):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
+        print(f"No.{i} is {prompts}")
         st = time.time()
-        img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
+        try:
+            img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
+        except Exception as e:
+            print(f"错误: {e}")
         time_list_first.append(time.time() - st)
         first_acceptance_length_list.append(acceptance_length_list)
         image_encodings.extend(img_enc)
@@ -268,6 +287,7 @@ def main(argv):
 
     B = 1
     videos = []
+    print("Begin generate ALL Frame")
     for i in tqdm(list(range(0, len(entries), B))):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
@@ -279,10 +299,10 @@ def main(argv):
         videos.extend(video)
 
     # ++++++++++++++++++++++++++Save_result++++++++++++++++++++++++++
-    # FIXME: eval bug
     import json
     all_acceptance_length_list = []
     file_out_path = '/home/leihaodong/AAAI25/exp/LWMSJD/test'
+    file_out_path = FLAGS.output_file
     file_out_video_path = os.path.join(file_out_path, 'video')
     os.makedirs(file_out_path, exist_ok=True)
     os.makedirs(file_out_video_path, exist_ok=True)
@@ -307,7 +327,7 @@ def main(argv):
         
         mean_accl_i = calculate_mean_nonzero(all_acceptance_length_list[i])
         new_entry = {
-            "prompt": ori_prompts[i],
+            "prompt": entry[i]['caption'],
             "times": time_i,  # 转换为 Python float
             "acc_l": mean_accl_i,       # 转换为 Python float
         }
@@ -327,7 +347,10 @@ def main(argv):
 
     # Video save
     for i,video in enumerate(videos):
-        name = f"{i}.mp4"
+        if len(video_name)>=i:
+            name = f"{video_name[i]}.mp4"
+        else:
+            name = f"{i}.mp4"
         writer = imageio.get_writer(os.path.join(file_out_video_path,name), fps=4)
         for frame in video:
             writer.append_data(frame)

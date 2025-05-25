@@ -529,6 +529,14 @@ def prefix_matching_next_tokens(
     )
 
 # For adapt
+# Method 1: Get the first 100 pairs
+def get_first_100_pairs(data,len=100):
+    return data[:len]
+
+# Method 2: Randomly get 100 pairs
+def get_random_100_pairs(data,len=100):
+    return random.sample(data, len)
+
 def debug(llama_config,params, layer=32, scan_layers=False,
           max_sequence_length=2048):
     # TODO:debug
