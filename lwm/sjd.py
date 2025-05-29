@@ -110,8 +110,6 @@ def get_multi_token_for_preparation(
             ) # TODO: jax format need to change
             rand_tokens = resampled_rand_tokens
             rand_probs = resampled_rand_probs
-            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int].set(0.0)#重新设置索引值
-            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int, resampled_rand_tokens[0]].set(1.0)
         elif 'repeat' in multi_token_init_scheme:
             rand_tokens = last_resampled_input_tokens
             rand_probs = last_resampled_input_probs
@@ -200,8 +198,6 @@ def get_update_window_token_FSJD(
             ) # TODO: jax format need to change
             rand_tokens = resampled_rand_tokens
             rand_probs = resampled_rand_probs
-            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int].set(0.0)#重新设置索引值
-            # rand_tokens_scores = rand_tokens_scores.at[:, valid_indices_int, resampled_rand_tokens[0]].set(1.0)
         elif 'repeat' in multi_token_init_scheme:
             rand_tokens = last_resampled_input_tokens
             rand_probs = last_resampled_input_probs
@@ -410,11 +406,6 @@ def find_first_misaligned_token_inds(input_tokens, next_tokens):
     b=0
     accept_index = 0 # accept_index in next_tokens
     L = input_tokens.shape[1]
-    # for i in range(1, input_tokens.shape[1]):
-    #     if input_tokens[b, i] == next_tokens[b, i-1]:
-    #         accept_index = i
-    #     else:
-    #         pass
     def greedy(i, accept_index):
         def accept_fn(accept_index):
             return i
@@ -466,16 +457,16 @@ def prefix_matching_next_tokens(
         )
         return reject_index, next_tokens, next_probs
     
-    def sampler_path(input_tokens, next_tokens, input_probs, next_token_probs):
+    def sampler_path(input_tokens, next_tokens, input_probs, next_probs):
         """Handle case when prefix_token_sampler is provided."""
-        reject_index, next_tokens, next_token_probs = prefix_token_sampler(
-            draft_tokens=input_tokens,
-            next_tokens=next_tokens,
-            draft_prob=input_probs,
-            next_prob=next_token_probs,
-            **kwargs
-        )
-        return reject_index, next_tokens, next_token_probs
+        reject_index = 1
+        if prefix_token_sampler is not None:
+            reject_index, next_tokens, next_probs = prefix_token_sampler(
+                input_tokens, next_tokens,
+                input_probs, next_probs,
+                **kwargs
+            )
+        return reject_index, next_tokens, next_probs
     
     # Conditionally execute based on whether prefix_token_sampler is provided
     reject_index, next_tokens, next_probs = lax.cond(
@@ -494,15 +485,15 @@ def prefix_matching_next_tokens(
         matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A
         def match(A1):
             matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A1
-            matched_tokens = lax.dynamic_update_slice(matched_tokens, next_tokens[:, i][None], (0, i))
-            matched_probs = lax.dynamic_update_slice(matched_probs, next_probs[:, i][None], (0, i, 0))
+            matched_tokens = lax.dynamic_update_slice(matched_tokens, next_tokens[:, i][:,None], (0, i))
+            matched_probs = lax.dynamic_update_slice(matched_probs, next_probs[:, i][:,None,:], (0, i, 0))
             return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs
         def unmatch(A1):
             matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A1
             # 空出index=0的位置给最新accept的token在unmatched_tokens, unmatched_probs中
             j = i - acceptance_length #j为不match的index
-            unmatched_tokens = lax.dynamic_update_slice(unmatched_tokens, next_tokens[:, i][None], (0, j+1))
-            unmatched_probs = lax.dynamic_update_slice(unmatched_probs, next_probs[:, i][None], (0, j+1, 0))
+            unmatched_tokens = lax.dynamic_update_slice(unmatched_tokens, next_tokens[:, i][:,None], (0, j+1))
+            unmatched_probs = lax.dynamic_update_slice(unmatched_probs, next_probs[:, i][:,None,:], (0, j+1, 0))
             return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs
         matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = jax.lax.cond(
             i < acceptance_length,
@@ -514,8 +505,8 @@ def prefix_matching_next_tokens(
     matched_next_tokens, matched_next_probs, unmatched_next_tokens, unmatched_next_probs = jax.lax.fori_loop(
         0, L, getslice, (matched_next_tokens, matched_next_probs, unmatched_next_tokens, unmatched_next_probs)
     )
-    unmatched_next_tokens = lax.dynamic_update_slice(unmatched_next_tokens, next_tokens[:, acceptance_length-1][None], (0, 0))
-    unmatched_next_probs = lax.dynamic_update_slice(unmatched_next_probs, next_probs[:, acceptance_length-1][None], (0, 0, 0))
+    unmatched_next_tokens = lax.dynamic_update_slice(unmatched_next_tokens, next_tokens[:, acceptance_length-1][:,None], (0, 0))
+    unmatched_next_probs = lax.dynamic_update_slice(unmatched_next_probs, next_probs[:, acceptance_length-1][:,None,:], (0, 0, 0))
     # matched_next_tokens = next_tokens[:, :acceptance_length]
     # matched_next_probs = next_probs[:, :acceptance_length]
     # unmatched_next_tokens = next_tokens[:, acceptance_length:]
@@ -530,11 +521,11 @@ def prefix_matching_next_tokens(
 
 # For adapt
 # Method 1: Get the first 100 pairs
-def get_first_100_pairs(data,len=100):
+def get_order_pairs(data,len=100):
     return data[:len]
 
 # Method 2: Randomly get 100 pairs
-def get_random_100_pairs(data,len=100):
+def get_random_pairs(data,len=100):
     return random.sample(data, len)
 
 def debug(llama_config,params, layer=32, scan_layers=False,
@@ -610,3 +601,52 @@ def debug(llama_config,params, layer=32, scan_layers=False,
     params = freeze(params)
     #NOTE:end
     return llama_config, params
+
+def limit_update_result(state,next_token,matched_next_probs):
+    next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
+    next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
+    next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
+    return next_sequences,next_candidate_sequences,next_candidate_probs
+
+def dynamic_update_result(state, next_token, matched_next_probs, max_length):
+    next_sequences, next_candidate_sequences, next_candidate_probs = (
+        state.sequences,
+        state.candidate_sequences,
+        state.candidate_probs,
+    )
+
+    def update_choose(i, A):
+        next_sequences, next_candidate_sequences, next_candidate_probs = A
+
+        def replace(next_sequences, next_candidate_sequences, next_candidate_probs):
+            j = i - state.cur_len
+            next_sequences = jax.lax.dynamic_update_slice(
+                next_sequences, next_token[:, j][:,None], (0, i)
+            )
+            next_candidate_sequences = jax.lax.dynamic_update_slice(
+                next_candidate_sequences, next_token[:, j][:,None], (0, i)
+            )
+            next_candidate_probs = jax.lax.dynamic_update_slice(
+                next_candidate_probs,
+                matched_next_probs[:, j][:,None,:],
+                (0, i, 0),
+            )
+            return next_sequences, next_candidate_sequences, next_candidate_probs
+
+        def keep(next_sequences, next_candidate_sequences, next_candidate_probs):
+            return next_sequences, next_candidate_sequences, next_candidate_probs
+
+        next_sequences, next_candidate_sequences, next_candidate_probs = jax.lax.cond(
+            i < max_length,
+            lambda: replace(next_sequences, next_candidate_sequences, next_candidate_probs),
+            lambda: keep(next_sequences, next_candidate_sequences, next_candidate_probs),
+        )
+        return next_sequences, next_candidate_sequences, next_candidate_probs
+
+    next_sequences, next_candidate_sequences, next_candidate_probs = jax.lax.fori_loop(
+        state.cur_len,
+        state.cur_len + next_token.shape[1],
+        update_choose,
+        (next_sequences, next_candidate_sequences, next_candidate_probs),
+    )
+    return next_sequences, next_candidate_sequences, next_candidate_probs

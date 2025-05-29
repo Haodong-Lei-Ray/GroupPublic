@@ -16,7 +16,7 @@ from tux import (
 )
 from lwm.vision_llama import VideoLLaMAConfig, FlaxVideoLLaMAForCausalLM
 from lwm.vqgan import VQGAN
-from lwm.sjd import debug,get_random_100_pairs,get_first_100_pairs
+from lwm.sjd import debug,get_random_pairs,get_order_pairs
 import time
 import pickle
 import os
@@ -43,7 +43,7 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     jax_distributed=JaxDistributedConfig.get_default_config(),
     # TODO: Update parameters of SJD
     rand_token_num=32,
-    prefix_token_sampler_scheme='speculative_jacobi',
+    prefix_token_sampler_scheme='sjd',
     prefill_way="fsjd",
     benchmark_path="/data/lei/dataset/MSRVTT", 
     eval_len=2,
@@ -196,9 +196,9 @@ def main(argv):
             for row in reader:
                 data.append(row)
         if FLAGS.benchmark_way == 'random':
-            data = get_random_100_pairs(data[1:],len=FLAGS.eval_len)
+            data = get_random_pairs(data[1:],len=FLAGS.eval_len)
         else:
-            data = get_first_100_pairs(data[1:],len=FLAGS.eval_len)
+            data = get_order_pairs(data[1:],len=FLAGS.eval_len)
         for i, row in enumerate(data):
             prompts.append(row[-1])
             video_name.append(row[-2])
@@ -215,6 +215,7 @@ def main(argv):
     first_acceptance_length_list, later_acceptance_length_list = [],[]
     time_list_first, time_list_later = [],[]
     images, image_encodings = [], []
+    video_encodings = []
     print("Begin generate First image")
     for i in tqdm(list(range(0, len(entries), B))):
         entries_i = entries[i:i + B]
@@ -270,7 +271,7 @@ def main(argv):
             v = vqgan.decode(v)
             v = ((jax.device_get(v) + 1) * 127.5).astype(np.uint8)
             vision.append(v)
-        return vision, acceptance_length_list
+        return output, vision, acceptance_length_list
 
     new_entries = []
     for img_enc, entry in zip(image_encodings, entries):
@@ -289,10 +290,11 @@ def main(argv):
         prompts = [entry['prompt'] for entry in entries_i]
         images = np.array([entry['image'] for entry in entries_i], dtype=np.int32)
         st = time.time()
-        video, acceptance_length_list = generate_video_pred(prompts, images, max_input_length=128)
+        video_code, video, acceptance_length_list = generate_video_pred(prompts, images, max_input_length=128)
         time_list_later.append(time.time() - st)
         later_acceptance_length_list.append(acceptance_length_list)
         videos.extend(video)
+        video_encodings.append(video_code)
 
     # ++++++++++++++++++++++++++Save_result++++++++++++++++++++++++++
     import json
@@ -340,10 +342,12 @@ def main(argv):
         json.dump(new_result_data, f, indent=4)
     with open(os.path.join(file_out_path,"accl_list.pkl"), 'wb') as f:
         pickle.dump(all_acceptance_length_list, f)
+    with open(os.path.join(file_out_path,"vision_code_list.pkl"), 'wb') as f:
+        pickle.dump(video_encodings, f)
 
     # Video save
     for i,video in enumerate(videos):
-        if len(video_name)>=i:
+        if len(video_name)>i:
             name = f"{video_name[i]}.mp4"
         else:
             name = f"{i}.mp4"

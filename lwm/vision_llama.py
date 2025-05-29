@@ -21,6 +21,7 @@ from tux import load_pickle, open_file
 from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
 import numpy as np
 from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, get_update_window_token_FSJD, init_array
+from lwm.sjd import limit_update_result,dynamic_update_result
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS
 
@@ -539,7 +540,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         # TODO:超参数修改点 "sjd" 8:1.58 16:1.60 32:2.01 64:1.77
         rand_token_num = self.config.rand_token_num # 8
         prefill_way = self.config.prefill_way # "sjd","fsjd"
-        prefix_token_sampler_scheme = self.config.prefix_token_sampler_scheme # 'jacobi','speculative_jacobi'
+        prefix_token_sampler_scheme = self.config.prefix_token_sampler_scheme # 'jd','sjd'
         print(f"runing the generation with len: {self.config.rand_token_num} prefill: {self.config.prefill_way} verify: {self.config.prefix_token_sampler_scheme}")
         img_vocab_size = self.config.vision_vocab_size
         # 用于预填充的random
@@ -600,12 +601,12 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             candidate_probs=candidate_probs,
         )
 
-        if prefix_token_sampler_scheme == 'speculative_jacobi':
+        if prefix_token_sampler_scheme == 'sjd':
             prefix_token_sampler = SpeculativeSampler(
                 generator=prng_key,  # 假设 self.generator 已是一个 JAX PRNGKey
                 sampling_last_draft_token=jnp.zeros(1),  # 使用 jnp.zeros，并移除多余的逗号
             )
-        elif prefix_token_sampler_scheme == 'jacobi':
+        elif prefix_token_sampler_scheme == 'jd':
             prefix_token_sampler = None
         else:
             raise ValueError(f"prefix_token_sampler_scheme: {prefix_token_sampler_scheme}")
@@ -721,7 +722,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             start_position = state.cur_len - initial_len + 1
             positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
             position_check = jax.lax.dynamic_slice(positon_indices, (start_position,), (matched_next_tokens.shape[1],)) % 257
-            # position_check = jnp.arange(start_position, start_position + matched_next_tokens.shape[1] + 1, dtype=jnp.int32) % 257
+            
+            # FIXME: bug 可疑点, 要检查是否是索引出现了问题
             matched_next_tokens = jax.lax.cond(
                 position_check.min() == 0,
                 lambda: matched_next_tokens.at[:, position_check.argmin()].set(8192),
@@ -737,10 +739,14 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id).max()
 
-            # Update 接受的token相关attribute
-            next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-            next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
-            next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
+            # Update 接受的token相关attribute dynamic_update_slice如果index超限,则会出现混乱的bug
+            
+            next_sequences,next_candidate_sequences,next_candidate_probs = jax.lax.cond(
+                state.cur_len + next_token.shape[1] - 1 >=  max_length,
+                lambda: limit_update_result(state,next_token,matched_next_probs),
+                lambda: dynamic_update_result(state,next_token,matched_next_probs,max_length)
+            )
+
             next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs, state.cur_len, rand_token_num, acceptance_length)
 
             acceptance_length_list = lax.dynamic_update_slice(state.acceptance_length_list, acceptance_length[None], (state.cur_len,))
