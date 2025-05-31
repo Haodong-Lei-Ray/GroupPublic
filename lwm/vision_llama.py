@@ -21,7 +21,7 @@ from tux import load_pickle, open_file
 from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
 import numpy as np
 from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, get_update_window_token_FSJD, init_array
-from lwm.sjd import limit_update_result,dynamic_update_result
+from lwm.sjd import limit_update_result,dynamic_update_result,update_candidate
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS
 
@@ -460,13 +460,13 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
     module_class = FlaxVideoLLaMAForCausalLMModule
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[jax.Array] = None, vision_masks = None
+        self, input_ids, max_length, rand_token_num = 0, attention_mask: Optional[jax.Array] = None, vision_masks = None
     ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 
-        past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        past_key_values = self.init_cache(batch_size, max_length+rand_token_num)
+        extended_attention_mask = jnp.ones((batch_size, max_length+rand_token_num), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
             extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
@@ -542,8 +542,10 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         prefill_way = self.config.prefill_way # "sjd","fsjd"
         prefix_token_sampler_scheme = self.config.prefix_token_sampler_scheme # 'jd','sjd'
         print(f"runing the generation with len: {self.config.rand_token_num} prefill: {self.config.prefill_way} verify: {self.config.prefix_token_sampler_scheme}")
+        img_width = 16
+        text_len = 128
         img_vocab_size = self.config.vision_vocab_size
-        # 用于预填充的random
+        # 用于预填充的random text_len=128
         pad_input_ids, pad_input_probs = init_array(rand_token_num, img_vocab_size)
         pad_input_ids = jnp.concatenate([pad_input_ids, pad_input_ids], axis=0)
         
@@ -555,6 +557,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         # candidate_sequences是用于复制的token
         candidate_sequences, candidate_probs = init_array(max_length, img_vocab_size)
         candidate_sequences = jnp.concatenate([candidate_sequences, candidate_sequences], axis=0)
+        candidate_sequences, candidate_probs = update_candidate(candidate_sequences, candidate_probs, input_ids, text_len=128,img_vocab_size=img_vocab_size)
 
         # per batch-item state bit indicating if sentence has finished.
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
@@ -564,7 +567,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         model = self.decode if self.config.is_encoder_decoder else self
 
         # initialize model specific kwargs
-        model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length, **model_kwargs)
+        model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length, rand_token_num, **model_kwargs)
 
         # 2. Init the mask and position. (attention_mask do not need to modify, because it is given length)
         # 2.1 new_position_ids
@@ -612,6 +615,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             raise ValueError(f"prefix_token_sampler_scheme: {prefix_token_sampler_scheme}")
 
         def prefill_inputtoken(state, prefill_way):
+            frame_number = (state.cur_len - text_len) / 257 # 判断处于哪一帧
             if prefill_way in ["base"]:
                 return SampleState(
                     cur_len=state.cur_len,
@@ -624,9 +628,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             elif prefill_way in ["sjd"]:
                 multi_token_init_scheme='repeat_horizon' #初始化方案, horizon or vertical
                 multi_token_init_scheme='repeat_vertical' #初始化方案, horizon or vertical
+                prefill_num = text_len + (img_width * img_width + 1)*frame_number #判断非此帧的token数量有多少
                 # multi_token_init_scheme='random' #初始化方案, horizon or vertical
-
-                # 1. Init the token and logits. prill to the running_token
                 running_token, running_probs = get_multi_token_for_preparation(rand_token_num=rand_token_num,
                                                                                 acceptance_length=state.acceptance_length,
                                                                                 input_ids=state.running_token,
@@ -635,7 +638,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                                                                                 candidate_probs=state.candidate_probs,
                                                                                 input_ids_len=state.cur_len,
                                                                                 multi_token_init_scheme=multi_token_init_scheme,
-                                                                                prefill_num = initial_len)
+                                                                                img_width = img_width,
+                                                                                prefill_num = prefill_num)
                 return SampleState(
                     cur_len=state.cur_len,
                     model_kwargs=state.model_kwargs,
@@ -651,6 +655,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 )
             elif prefill_way in ["fsjd"]:
                 multi_token_init_scheme='repeat_random' #初始化方案, horizon or vertical
+                prefill_num = text_len #删去text的长度
                 running_token, running_probs = get_update_window_token_FSJD(rand_token_num=rand_token_num,
                                                                                 acceptance_length=state.acceptance_length,
                                                                                 input_ids=state.running_token,
@@ -659,7 +664,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                                                                                 candidate_probs=state.candidate_probs,
                                                                                 input_ids_len=state.cur_len,
                                                                                 multi_token_init_scheme=multi_token_init_scheme,
-                                                                                prefill_num = initial_len)
+                                                                                prefill_num = prefill_num)
                 return SampleState(
                     cur_len=state.cur_len,
                     model_kwargs=state.model_kwargs,
@@ -720,7 +725,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             
             # 3. Update and Judge stop signal: Split with 8192
             start_position = state.cur_len - initial_len + 1
-            positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
+            positon_indices = jnp.arange(0, max_length, dtype=jnp.int32)
             position_check = jax.lax.dynamic_slice(positon_indices, (start_position,), (matched_next_tokens.shape[1],)) % 257
             
             # FIXME: bug 可疑点, 要检查是否是索引出现了问题
@@ -729,20 +734,14 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 lambda: matched_next_tokens.at[:, position_check.argmin()].set(8192),
                 lambda: matched_next_tokens
             )
-            # next_token = jax.lax.cond(
-            #     (state.cur_len - initial_len + 1) % 257 == 0,
-            #     lambda: jnp.full_like(next_token, 8192),
-            #     lambda: next_token
-            # )
             next_token = jnp.concatenate([matched_next_tokens, matched_next_tokens], axis=0)
             unmatched_next_tokens = jnp.concatenate([unmatched_next_tokens, unmatched_next_tokens], axis=0)
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id).max()
 
             # Update 接受的token相关attribute dynamic_update_slice如果index超限,则会出现混乱的bug
-            
             next_sequences,next_candidate_sequences,next_candidate_probs = jax.lax.cond(
-                state.cur_len + next_token.shape[1] - 1 >=  max_length,
+                state.cur_len + next_token.shape[1] - 1 <  max_length,
                 lambda: limit_update_result(state,next_token,matched_next_probs),
                 lambda: dynamic_update_result(state,next_token,matched_next_probs,max_length)
             )

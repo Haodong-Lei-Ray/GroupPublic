@@ -105,7 +105,8 @@ def main(argv):
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
-        # llama_config, params = debug(llama_config, params, layer=2, scan_layers=True)
+        # BUG
+        # llama_config, params = debug(llama_config, params, layer=1, scan_layers=True)
         #NOTE:fix a bug input_shape=(512, 8192)-->input_shape=(256, llama_config.max_sequence_length)
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,

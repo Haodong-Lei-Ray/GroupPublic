@@ -49,8 +49,8 @@ def get_multi_token_for_preparation(
     acceptance_length,
     input_ids,
     input_probs,
-    candidate_ids, #已有的token, 固定的大小, (2, 385) 往里面填东西
-    candidate_probs, #已有的probs, 固定的大小, (2, 385, :) 往里面填东西
+    candidate_ids, 
+    candidate_probs, 
     input_ids_len,
     img_width = 16,
     multi_token_init_scheme=None, #初始化方案, horizon or vertical
@@ -61,9 +61,8 @@ def get_multi_token_for_preparation(
     pad_len = 0 # pad_len = right_above
     img_width = img_width + pad_len if img_width is not None else 0
     if (img_width > 0) :
-        positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
+        positon_indices = jnp.arange(0, candidate_ids.shape[-1], dtype=jnp.int32)
         positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
-        # TODO: check the indices [unmatch]
         horizon_indices = positon_indices % img_width
         vertical_indices = positon_indices // img_width
 
@@ -134,8 +133,8 @@ def get_update_window_token_FSJD(
     acceptance_length,
     input_ids,
     input_probs,
-    candidate_ids, #已有的token, 固定的大小, (2, 385) 往里面填东西
-    candidate_probs, #已有的probs, 固定的大小, (2, 385, :) 往里面填东西
+    candidate_ids, 
+    candidate_probs, 
     input_ids_len,
     img_width = 16,
     multi_token_init_scheme=None, #初始化方案, horizon or vertical
@@ -147,9 +146,8 @@ def get_update_window_token_FSJD(
     img_width = img_width + pad_len if img_width is not None else 0
     # 2. if there exist input_ids to cat
     if (img_width > 0) and (rand_token_num > 0):
-        positon_indices = jnp.arange(0, 385, dtype=jnp.int32)
+        positon_indices = jnp.arange(0, candidate_ids.shape[-1], dtype=jnp.int32)
         positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
-        # TODO: check the indices [unmatch]
         horizon_indices = positon_indices % img_width
         vertical_indices = positon_indices // img_width
 
@@ -170,21 +168,17 @@ def get_update_window_token_FSJD(
         # TODO: 似乎这样的更新存在一定的问题
         last_candidate_tokens = candidate_ids
         last_candidate_probs = candidate_probs
-        # last_candidate_tokens = lax.dynamic_update_slice(
-        #     candidate_ids, input_ids[:,-rand_token_num:], 
-        #     (0, input_ids_len)
-        #     )
-        # last_candidate_probs = lax.dynamic_update_slice(
-        #     candidate_probs, input_probs[:,-rand_token_num:], 
-        #     (0, input_ids_len, 0)
-        #     )
 
-        # 一维的索引值 可能是空的, 可能是非空的. 如果是非空的, 就采取某种策略去做token的选取
-        # last_vertical_indices and last_horizon_indices is (2, rand_token_num)
+        # TODO: 不知道索引的对不对, 对的
         last_flatten_indices = last_vertical_indices * img_width + last_horizon_indices + prefill_num
         # e.g., last indices [100, 101, 102], but the current indices up to 100, 
         # and 101, 102 depends on the values from 100 (but 100 has not been appended to input-ids yet)
-        last_flatten_indices = jnp.clip(last_flatten_indices, a_min=0, a_max=last_candidate_tokens.shape[1] - 1)
+        last_frame_flatten_indices = last_flatten_indices - img_width * img_width - 1 - prefill_num# 1 is 8196 pad token
+        last_flatten_indices = jax.lax.cond(
+            last_frame_flatten_indices.min() < 0,
+            lambda: jnp.clip(last_flatten_indices, a_min=0, a_max=last_candidate_tokens.shape[1] - 1),
+            lambda: last_frame_flatten_indices + prefill_num,
+        )
         
         # Repeat的token以及logits last_input_tokens-->(2, rand_token_num)
         last_resampled_input_tokens = last_candidate_tokens[:, last_flatten_indices]
@@ -215,6 +209,16 @@ def get_update_window_token_FSJD(
         )
     
     return input_ids, input_probs
+
+def update_candidate(candidate_sequences, candidate_probs, input_ids, text_len, img_vocab_size):
+    # 更新candidate_sequences
+    vision_token_ids = input_ids[:,text_len:]
+    candidate_sequences = lax.dynamic_update_slice(candidate_sequences, vision_token_ids, (0, text_len))
+    # 更新出对应的概率分布
+    vision_token_probs = jnp.zeros((1, vision_token_ids.shape[-1], img_vocab_size), dtype=jnp.float32)
+    vision_token_probs = vision_token_probs.at[:, jnp.arange(vision_token_ids.shape[-1]), vision_token_ids[:1]].set(1.0)
+    candidate_probs = lax.dynamic_update_slice(candidate_probs, vision_token_probs, (0, text_len, 0))
+    return candidate_sequences, candidate_probs
 
 # Verify
 import jax
@@ -530,7 +534,7 @@ def get_random_pairs(data,len=100):
 
 def debug(llama_config,params, layer=32, scan_layers=False,
           max_sequence_length=2048):
-    # TODO:debug
+    # NOTE:debug
     llama_config.update(dict(
         num_hidden_layers=layer,
         scan_layers=scan_layers
