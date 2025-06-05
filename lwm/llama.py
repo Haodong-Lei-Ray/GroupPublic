@@ -29,6 +29,8 @@ from ml_collections import ConfigDict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh
 from ringattention import ringattention, blockwise_feedforward, ringattention_jax, ringattention_inference
 
+from lwm.sjd import limit_update_kvcahce, dynamic_update_kvcahce
+
 
 LLAMA_STANDARD_CONFIGS = {
     '200m': {
@@ -449,7 +451,7 @@ class FlaxLLaMAAttention(nn.Module):
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             # update key, value caches with our new 1d spatial slices
             cur_index = cache_index.value
-            if query.shape[1] == 1:
+            if query.shape[1] == 1:#BUG
                 mesh = LLaMAConfig.get_jax_mesh(self.config.mesh_dim)
                 def fn(cached_key, cached_value, key, value, cur_index):
                     assert key.shape[1] == 1 and value.shape[1] == 1, (key.shape, value.shape)
@@ -482,9 +484,15 @@ class FlaxLLaMAAttention(nn.Module):
                 )
                 key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
             else:
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0) # indices -> (0, Traced<ShapedArray(int32[]):JaxprTrace(level=1/0)>, 0, 0)
+                #BUG
+                key, value = jax.lax.cond(
+                    cur_index + key.shape[1] - 1 < cached_key.value.shape[1],
+                    lambda: limit_update_kvcahce(cached_key.value, key, cached_value.value, value, indices),
+                    lambda: dynamic_update_kvcahce(cached_key.value, key, cached_value.value, value, indices),
+                )
+                # key = lax.dynamic_update_slice(cached_key.value, key, indices)#BUG
+                # value = lax.dynamic_update_slice(cached_value.value, value, indices)#BUG
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
@@ -503,7 +511,7 @@ class FlaxLLaMAAttention(nn.Module):
     ):
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        if xq.shape[1] == 1:
+        if xq.shape[1] == 1:#BUG
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "tp"))
         else:
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), "sp", "tp"))
@@ -596,7 +604,7 @@ class FlaxLLaMAAttention(nn.Module):
             if self.has_variable("cache", "cached_key") or init_cache:
                 xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
 
-            q_sp_dim = None if xq.shape[1] == 1 else 'sp'
+            q_sp_dim = None if xq.shape[1] == 1 else 'sp'#BUG
             attn_weights = None
             ring_attention_sharded = shard_map(
                 partial(ringattention_inference, axis_name="sp"), mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),

@@ -44,7 +44,7 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     # TODO: Update parameters of SJD
     rand_token_num=32,
     prefix_token_sampler_scheme='sjd',
-    prefill_way="fsjd",
+    prefill_way="line", # line frame base
     benchmark_path="/data/lei/dataset/MSRVTT", 
     eval_len=2,
     benchmark_way="order"
@@ -59,6 +59,14 @@ def calculate_mean_nonzero(combined_array):
     return mean_non_zero
 
 def main(argv):
+    #FIXME
+    # 文件路径
+    file_path = '/home/leihaodong/AAAI25/exp/LWM/target/fire_work_32.pkl'
+
+    # 加载 .pkl 文件
+    with open(file_path, 'rb') as file:
+        sequences_label = pickle.load(file)
+    #FIXME
     assert FLAGS.output_file != ''
 
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
@@ -106,11 +114,11 @@ def main(argv):
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
         # BUG
-        # llama_config, params = debug(llama_config, params, layer=1, scan_layers=True)
+        # llama_config, params = debug(llama_config, params, layer=1, scan_layers=True,max_sequence_length=8192)
         #NOTE:fix a bug input_shape=(512, 8192)-->input_shape=(256, llama_config.max_sequence_length)
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,
-            input_shape=(4, llama_config.max_sequence_length),#(512, 8192),
+            input_shape=(4, 8192),#(512, 8192),
             seed=FLAGS.seed,
             _do_init=False,
             dtype=get_float_dtype_by_name(FLAGS.dtype),
@@ -171,6 +179,7 @@ def main(argv):
             attention_mask=inputs.attention_mask,
             vision_masks=np.zeros(inputs.input_ids.shape, dtype=bool),
         )
+        st = time.time()
         with mesh:
             output, sharded_rng = _sharded_forward_generate(
                 params, sharded_rng, batch,
@@ -180,10 +189,11 @@ def main(argv):
             output_bio = jax.device_get(output)
             output = np.split(output_bio, 2, axis=0)[0]
             acceptance_length_list = np.split(output_bio, 2, axis=0)[1]
+        st = time.time() - st
         output = output.reshape(len(prompts) // 2, tokens_per_frame)
         image = vqgan.decode(output[:, :-1].reshape(-1, 16, 16))
         image = ((jax.device_get(image) + 1) * 127.5).astype(np.uint8)
-        return output, image, acceptance_length_list
+        return output, image, acceptance_length_list, st
 
     sharded_rng = next_rng()
     video_name = []
@@ -222,9 +232,8 @@ def main(argv):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
         print(f"No.{i} is {prompts}")
-        st = time.time()
-        img_enc, img, acceptance_length_list = generate_first_frame(prompts, max_input_length=128)
-        time_list_first.append(time.time() - st)
+        img_enc, img, acceptance_length_list, st = generate_first_frame(prompts, max_input_length=128)
+        time_list_first.append(st)
         first_acceptance_length_list.append(acceptance_length_list)
         image_encodings.extend(img_enc)
         images.extend(img)
@@ -255,6 +264,7 @@ def main(argv):
                 np.ones(images.shape, dtype=bool)
             ], axis=1),
         )
+        st = time.time()
         with mesh:
             output, sharded_rng = _sharded_forward_generate(
                 params, sharded_rng, batch,
@@ -264,15 +274,22 @@ def main(argv):
             output_bio = jax.device_get(output)
             output = np.split(output_bio, 2, axis=0)[0]
             acceptance_length_list = np.split(output_bio, 2, axis=0)[1]
+        st = time.time() - st
         output = output.reshape(len(prompts) // 2, FLAGS.n_frames - 1, tokens_per_frame)
         output = np.concatenate([images[:len(prompts) // 2, None], output], axis=1)
+        #FIXME
+        for i in range(sequences_label.shape[1]):
+            for j in range(sequences_label.shape[2]):
+                if sequences_label[0,i,j]!=output[0,i,j]:
+                    print(f"{i} {j} is wrong")
+        #FIXME
         output = output[:, :, :-1].reshape(-1, FLAGS.n_frames, 16, 16)
         vision = []
         for v in output:
             v = vqgan.decode(v)
             v = ((jax.device_get(v) + 1) * 127.5).astype(np.uint8)
             vision.append(v)
-        return output, vision, acceptance_length_list
+        return output, vision, acceptance_length_list, st
 
     new_entries = []
     for img_enc, entry in zip(image_encodings, entries):
@@ -290,9 +307,8 @@ def main(argv):
         entries_i = entries[i:i + B]
         prompts = [entry['prompt'] for entry in entries_i]
         images = np.array([entry['image'] for entry in entries_i], dtype=np.int32)
-        st = time.time()
-        video_code, video, acceptance_length_list = generate_video_pred(prompts, images, max_input_length=128)
-        time_list_later.append(time.time() - st)
+        video_code, video, acceptance_length_list, st = generate_video_pred(prompts, images, max_input_length=128)
+        time_list_later.append(st)
         later_acceptance_length_list.append(acceptance_length_list)
         videos.extend(video)
         video_encodings.append(video_code)
