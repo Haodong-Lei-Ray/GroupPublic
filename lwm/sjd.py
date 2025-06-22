@@ -49,8 +49,8 @@ def get_multi_token_for_preparation(
     # 1.1 Init more, change the prefill_num
     pad_len = 0 # pad_len = right_above
     img_width = img_width + pad_len if img_width is not None else 0
-    if (img_width > 0) :
-        positon_indices = jnp.arange(0, candidate_ids.shape[-1], dtype=jnp.int32)
+    if (img_width > 0) and (rand_token_num > 0):
+        positon_indices = jnp.arange(0, candidate_ids.shape[-1]+rand_token_num*2, dtype=jnp.int32)#BUG
         positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
         horizon_indices = positon_indices % img_width
         vertical_indices = positon_indices // img_width
@@ -68,16 +68,9 @@ def get_multi_token_for_preparation(
             last_horizon_indices = horizon_indices
         else:
             assert False, f"multi_token_init_scheme should be 'horizon' 'random' or 'vertical', but got {multi_token_init_scheme}"
-        
-        # 填充操作 把上一时刻没有match的token加到候选项
-        last_candidate_tokens = lax.dynamic_update_slice(
-            candidate_ids, input_ids[:,-rand_token_num:], 
-            (0, input_ids_len)
-            )
-        last_candidate_probs = lax.dynamic_update_slice(
-            candidate_probs, input_probs[:,-rand_token_num:], 
-            (0, input_ids_len, 0)
-            )
+
+        last_candidate_tokens = candidate_ids
+        last_candidate_probs = candidate_probs
 
         # 一维的索引值 可能是空的, 可能是非空的. 如果是非空的, 就采取某种策略去做token的选取
         # last_vertical_indices and last_horizon_indices is (2, rand_token_num)
@@ -103,7 +96,7 @@ def get_multi_token_for_preparation(
             rand_probs = last_resampled_input_probs
         else:
             assert False, f"multi_token_init_scheme should be 'sample' or 'repeat', but got {multi_token_init_scheme}"
-        def prefill_token_line(i, A):#做替换填充
+        def prefill_token_line(i, A):#做替换填充 # BUG
             input_ids_i, input_probs_i = A
             input_ids_i = input_ids_i.at[:, i].set(rand_tokens[:,i])
             input_probs_i = input_probs_i.at[:, i].set(rand_probs[:,i])
@@ -133,7 +126,7 @@ def get_update_window_token_FSJD(
     img_width = img_width + pad_len if img_width is not None else 0
     # 2. if there exist input_ids to cat
     if (img_width > 0) and (rand_token_num > 0):
-        positon_indices = jnp.arange(0, candidate_ids.shape[-1], dtype=jnp.int32)
+        positon_indices = jnp.arange(0, candidate_ids.shape[-1]+rand_token_num*2, dtype=jnp.int32)#BUG
         positon_indices = jax.lax.dynamic_slice(positon_indices, (input_ids_len,), (rand_token_num,)) - prefill_num
         horizon_indices = positon_indices % img_width
         vertical_indices = positon_indices // img_width
@@ -362,9 +355,10 @@ class SpeculativeSampler:
                     )
 
                 # 2. 进行推测性采样
+                # sampled_draft_prob = 1#BUG
                 next_tokens_i, next_probs_i, \
                 rejected_index_list_i, key_i= jax.lax.cond(
-                    r < jnp.minimum(sampled_target_prob / sampled_draft_prob, 1.0),
+                    r < jnp.minimum(sampled_target_prob / sampled_draft_prob, 1.0),#BUG: 可能弄反了
                     accept_fn,
                     reject_fn,
                     key_i
@@ -418,71 +412,56 @@ def prefix_matching_next_tokens(
     prefix_token_sampler=None,
     **kwargs
 ):
-    def default_path():
-        """Handle case when prefix_token_sampler is None."""
-        reject_index = find_first_misaligned_token_inds(
+    if prefix_token_sampler is None:
+        acceptance_length = find_first_misaligned_token_inds(
             input_tokens, next_tokens
         )
-        return reject_index, next_tokens, next_probs
+    else:
+        acceptance_length, next_tokens, next_probs = prefix_token_sampler(
+            input_tokens, next_tokens,
+            input_probs, next_probs,
+            **kwargs
+        )
     
-    def sampler_path(input_tokens, next_tokens, input_probs, next_probs):
-        """Handle case when prefix_token_sampler is provided."""
-        reject_index = 1
-        if prefix_token_sampler is not None:
-            reject_index, next_tokens, next_probs = prefix_token_sampler(
-                input_tokens, next_tokens,
-                input_probs, next_probs,
-                **kwargs
-            )
-        return reject_index, next_tokens, next_probs
-    
-    # Conditionally execute based on whether prefix_token_sampler is provided
-    reject_index, next_tokens, next_probs = lax.cond(
-        prefix_token_sampler is None,
-        lambda: default_path(),
-        lambda: sampler_path(input_tokens, next_tokens, input_probs, next_probs),
-    )
-    
-    # Split tokens and scores based on matched_num
-    acceptance_length = reject_index
-    # return acceptance_length, next_tokens, next_probs
     B,L,D = next_probs.shape
-    matched_next_tokens, matched_next_probs = init_array(L,D)
-    unmatched_next_tokens, unmatched_next_probs = init_array(L,D)
+    
+    matched_next_tokens = jnp.full((1, L), 0, dtype=jnp.int32)
+    matched_next_probs = jnp.full((1, L, D), 0, dtype=jnp.float32)
+    unmatched_next_tokens = jnp.full((1, L-1), -1, dtype=jnp.int32)
+    unmatched_next_probs = jnp.full((1, L-1, D), -1, dtype=jnp.float32)
     def getslice(i, A):
         matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A
-        # BUG
-        def match(matched_tokens, matched_probs, unmatched_tokens, unmatched_probs):
+        def match(A1):
+            matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A1
             matched_tokens = lax.dynamic_update_slice(matched_tokens, next_tokens[:, i][:,None], (0, i))
             matched_probs = lax.dynamic_update_slice(matched_probs, next_probs[:, i][:,None,:], (0, i, 0))
             return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs
-        def unmatch(matched_tokens, matched_probs, unmatched_tokens, unmatched_probs):
+        def unmatch(A1):
+            matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = A1
             # 空出index=0的位置给最新accept的token在unmatched_tokens, unmatched_probs中
             j = i - acceptance_length #j为不match的index
-            unmatched_tokens = lax.dynamic_update_slice(unmatched_tokens, next_tokens[:, i][:,None], (0, j+1))
-            unmatched_probs = lax.dynamic_update_slice(unmatched_probs, next_probs[:, i][:,None,:], (0, j+1, 0))
+            if unmatched_tokens.shape[1]>=1:
+                unmatched_tokens = lax.dynamic_update_slice(unmatched_tokens, next_tokens[:, i][:,None], (0, j))
+                unmatched_probs = lax.dynamic_update_slice(unmatched_probs, next_probs[:, i][:,None,:], (0, j, 0))
             return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs
         matched_tokens, matched_probs, unmatched_tokens, unmatched_probs = jax.lax.cond(
             i < acceptance_length,
-            lambda: match(matched_tokens, matched_probs, unmatched_tokens, unmatched_probs),
-            lambda: unmatch(matched_tokens, matched_probs, unmatched_tokens, unmatched_probs)
+            match,
+            unmatch,
+            (matched_tokens, matched_probs, unmatched_tokens, unmatched_probs)
         )
         return matched_tokens, matched_probs, unmatched_tokens, unmatched_probs
     matched_next_tokens, matched_next_probs, unmatched_next_tokens, unmatched_next_probs = jax.lax.fori_loop(
         0, L, getslice, (matched_next_tokens, matched_next_probs, unmatched_next_tokens, unmatched_next_probs)
     )
-    unmatched_next_tokens = lax.dynamic_update_slice(unmatched_next_tokens, next_tokens[:, acceptance_length-1][:,None], (0, 0))
-    unmatched_next_probs = lax.dynamic_update_slice(unmatched_next_probs, next_probs[:, acceptance_length-1][:,None,:], (0, 0, 0))
-    # matched_next_tokens = next_tokens[:, :acceptance_length]
-    # matched_next_probs = next_probs[:, :acceptance_length]
-    # unmatched_next_tokens = next_tokens[:, acceptance_length:]
-    # unmatched_next_probs = next_probs[:, acceptance_length:]
+    running_tokens = jnp.concatenate([next_tokens[:, acceptance_length-1][:,None],unmatched_next_tokens], axis=1)
+    running_probs = jnp.concatenate([next_probs[:, acceptance_length-1][:,None,:],unmatched_next_probs], axis=1)
     return (
         acceptance_length,
         matched_next_tokens,
-        unmatched_next_tokens,
+        running_tokens,
         matched_next_probs,
-        unmatched_next_probs
+        running_probs
     )
 
 # For adapt

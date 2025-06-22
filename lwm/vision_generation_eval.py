@@ -20,6 +20,7 @@ from lwm.sjd import debug,get_random_pairs,get_order_pairs
 import time
 import pickle
 import os
+from datasets import load_dataset
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
     prompt='MSRVTT',#'VBench' 'MSRVTT'
@@ -59,14 +60,6 @@ def calculate_mean_nonzero(combined_array):
     return mean_non_zero
 
 def main(argv):
-    #FIXME
-    # 文件路径
-    file_path = '/home/leihaodong/AAAI25/exp/LWM/target/fire_work_32.pkl'
-
-    # 加载 .pkl 文件
-    with open(file_path, 'rb') as file:
-        sequences_label = pickle.load(file)
-    #FIXME
     assert FLAGS.output_file != ''
 
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
@@ -114,11 +107,11 @@ def main(argv):
                 FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
         )
         # BUG
-        # llama_config, params = debug(llama_config, params, layer=1, scan_layers=True,max_sequence_length=8192)
+        # llama_config, params = debug(llama_config, params, layer=2, scan_layers=True,max_sequence_length=8192)
         #NOTE:fix a bug input_shape=(512, 8192)-->input_shape=(256, llama_config.max_sequence_length)
         model = FlaxVideoLLaMAForCausalLM(
             llama_config,
-            input_shape=(4, 8192),#(512, 8192),
+            input_shape=(256, 8192),#(512, 8192),
             seed=FLAGS.seed,
             _do_init=False,
             dtype=get_float_dtype_by_name(FLAGS.dtype),
@@ -213,6 +206,13 @@ def main(argv):
         for i, row in enumerate(data):
             prompts.append(row[-1])
             video_name.append(row[-2])
+    elif "webvid-10M" in FLAGS.prompt:
+        data = load_dataset("TempoFunk/webvid-10M",split='validation')
+        if FLAGS.benchmark_way == 'random':
+            data = data.shuffle()
+        data=data[:FLAGS.eval_len]
+        prompts = data['name']
+        video_name = data['videoid']
     else:
         prompts = [FLAGS.prompt]
     entries = []
@@ -277,12 +277,6 @@ def main(argv):
         st = time.time() - st
         output = output.reshape(len(prompts) // 2, FLAGS.n_frames - 1, tokens_per_frame)
         output = np.concatenate([images[:len(prompts) // 2, None], output], axis=1)
-        #FIXME
-        for i in range(sequences_label.shape[1]):
-            for j in range(sequences_label.shape[2]):
-                if sequences_label[0,i,j]!=output[0,i,j]:
-                    print(f"{i} {j} is wrong")
-        #FIXME
         output = output[:, :, :-1].reshape(-1, FLAGS.n_frames, 16, 16)
         vision = []
         for v in output:
@@ -316,7 +310,6 @@ def main(argv):
     # ++++++++++++++++++++++++++Save_result++++++++++++++++++++++++++
     import json
     all_acceptance_length_list = []
-    file_out_path = '/home/leihaodong/AAAI25/exp/LWMSJD/test'
     file_out_path = FLAGS.output_file
     file_out_video_path = os.path.join(file_out_path, 'video')
     os.makedirs(file_out_path, exist_ok=True)
@@ -342,9 +335,10 @@ def main(argv):
         
         mean_accl_i = calculate_mean_nonzero(all_acceptance_length_list[i])
         new_entry = {
+            "video_name": video_name[i],
             "prompt": entries[i]['caption'],
-            "times": time_i,  # 转换为 Python float
-            "acc_l": mean_accl_i,       # 转换为 Python float
+            "times": time_i,
+            "acc_l": mean_accl_i,
         }
         mean_time += time_i
         mean_accl += mean_accl_i

@@ -24,6 +24,7 @@ from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_t
 from lwm.sjd import limit_update_result,dynamic_update_result,update_candidate
 from lwm.sjd import judge_token_sequence
 import pickle
+import os
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS
 
@@ -312,7 +313,6 @@ class FlaxVideoLLaMAModule(nn.Module):
     ):
         input_ids = input_ids.astype("i4")
 
-        # if input_ids.shape[1] == 1:
         if input_ids.shape[1] == 1 or input_ids.shape[1] == self.config.rand_token_num + 1:# BUG
             if self.config.sample_mode == 'text':
                 input_embeds = self.wte(input_ids)
@@ -429,7 +429,7 @@ class FlaxVideoLLaMAForCausalLMModule(nn.Module):
         if self.config.tie_vision_embeddings:
             shared_kernel = self.transformer.variables["params"]["vte"]["embedding"].T
             vision_logits = self.vision_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
-        else:
+        else:#BUG FIXME
             vision_logits = self.vision_head(hidden_states)
 
         if self.config.tie_word_embeddings:
@@ -463,16 +463,14 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
     module_class = FlaxVideoLLaMAForCausalLMModule
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, rand_token_num = 0, attention_mask: Optional[jax.Array] = None, vision_masks = None
+        self, input_ids, max_length, attention_mask: Optional[jax.Array] = None, vision_masks = None
     ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 
-        # BUG: 似乎长度不同也有问题
-        # past_key_values = self.init_cache(batch_size, max_length)
-        # extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-        past_key_values = self.init_cache(batch_size, max_length+rand_token_num)
-        extended_attention_mask = jnp.ones((batch_size, max_length+rand_token_num), dtype="i4")
+        past_key_values = self.init_cache(batch_size, max_length)
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        # attention_mask = attention_mask.astype("i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
             extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
@@ -500,8 +498,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         acceptance_position_ids = jax.lax.dynamic_slice(model_kwargs['position_ids'], (0,seq_len-rand_token_num-2+acceptance_length), (batch_size,1))
         new_position_ids = acceptance_position_ids + jnp.arange(1, 2+rand_token_num, dtype=jnp.int32)[None, :]
         # 2.2 new_mask
-        sub_vision_masks = np.full((model_kwargs["vision_masks"].shape[0], rand_token_num), True, dtype=bool)
-        new_vision_masks = jnp.concatenate([model_kwargs["vision_masks"][:, -1:], sub_vision_masks], axis=1)
+        new_vision_masks = np.full((model_kwargs["vision_masks"].shape[0], rand_token_num+1), True, dtype=bool)
 
         return {
             "past_key_values":  model_outputs.past_key_values,
@@ -524,11 +521,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         params: Optional[Dict[str, jnp.ndarray]] = None,
         model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
     ):
-        #FIXME
-        # file_path = '/home/leihaodong/AAAI25/exp/LWM/target/fire_work_1.pkl'
-        # with open(file_path, 'rb') as file:
-        #     sequences_label = pickle.load(file)
-        #FIXME
         # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
@@ -536,37 +528,38 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
+        input_ids = input_ids.astype(jnp.int32)
         initial_len = cur_len
-
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
-        cur_len = jnp.array(cur_len)
-
-        # per batch-item holding current token in loop.
-        sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
-        sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
-
-        # TODO:超参数修改点 "sjd" 8:1.58 16:1.60 32:2.01 64:1.77
+        # TODO:超参数修改点 "sjd"
         rand_token_num = self.config.rand_token_num # 8
+        flag_begin = False
         prefill_way = self.config.prefill_way # line frame base
         prefix_token_sampler_scheme = self.config.prefix_token_sampler_scheme # 'jd','sjd'
         print(f"runing the generation with len: {self.config.rand_token_num} prefill: {self.config.prefill_way} verify: {self.config.prefix_token_sampler_scheme}")
         img_width = 16
         text_len = 128
         img_vocab_size = self.config.vision_vocab_size
+        # TODO:超参数修改点 "sjd"
+
+        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
+        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        cur_len = jnp.array(cur_len)
+
+        # per batch-item holding current token in loop.
+        sequences = jnp.full((batch_size, max_length+rand_token_num*2), pad_token_id, dtype=jnp.int32)
+        sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
+
         # 用于预填充的random text_len=128
         pad_input_ids, pad_input_probs = init_array(rand_token_num, img_vocab_size)
         pad_input_ids = jnp.concatenate([pad_input_ids, pad_input_ids], axis=0)
         
-        input_probs = jnp.zeros((1, input_ids.shape[1], img_vocab_size), dtype=jnp.float32)
+        input_probs = jnp.zeros((1, input_ids.shape[1], img_vocab_size), dtype=self.dtype)
         
         input_ids = jnp.concatenate([input_ids, pad_input_ids], axis=-1)
         input_probs = jnp.concatenate([input_probs, pad_input_probs], axis=1)
 
-        # candidate_sequences是用于复制的token
-        candidate_sequences, candidate_probs = init_array(max_length, img_vocab_size)
-        candidate_sequences = jnp.concatenate([candidate_sequences, candidate_sequences], axis=0)
-        candidate_sequences, candidate_probs = update_candidate(candidate_sequences, candidate_probs, input_ids, text_len=128,img_vocab_size=img_vocab_size)
+        candidate_sequences = jnp.full((batch_size, max_length+rand_token_num*2), pad_token_id, dtype=jnp.int32)
+        candidate_probs = jnp.full((1, max_length+rand_token_num*2, img_vocab_size), pad_token_id, dtype=self.dtype)
 
         # per batch-item state bit indicating if sentence has finished.
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
@@ -576,7 +569,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         model = self.decode if self.config.is_encoder_decoder else self
 
         # initialize model specific kwargs
-        model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length, rand_token_num, **model_kwargs)
+        model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length+rand_token_num*2, **model_kwargs)
 
         # 2. Init the mask and position. (attention_mask do not need to modify, because it is given length)
         # 2.1 new_position_ids
@@ -596,12 +589,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             "attention_mask": model_kwargs["attention_mask"],
             "vision_masks": new_vision_masks
         }
-        acceptance_length_list = jnp.empty((max_length), dtype=jnp.int32)
+        acceptance_length_list = jnp.empty((max_length+rand_token_num*2), dtype=jnp.int32)
 
-        #FIXME
-        # fid = 0 if initial_len==128 else 1
-        # assert judge_token_sequence(sequences,sequences_label,cur_len,id=fid),f"Wrong in {cur_len}"
-        #FIXME
         # initialize state
         state = SampleState(
             cur_len=cur_len,
@@ -611,7 +600,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             is_sent_finished=is_sent_finished,
             prng_key=prng_key,
             model_kwargs=model_kwargs,
-            acceptance_length=jnp.array(rand_token_num+1),
+            acceptance_length=jnp.array(1),
             acceptance_length_list = acceptance_length_list,
             candidate_sequences=candidate_sequences,
             candidate_probs=candidate_probs,
@@ -627,9 +616,9 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         else:
             raise ValueError(f"prefix_token_sampler_scheme: {prefix_token_sampler_scheme}")
 
-        def prefill_inputtoken(state, prefill_way):
-            frame_number = (state.cur_len - text_len) / 257 # 判断处于哪一帧
-            frame_number = frame_number.astype(jnp.int32)
+        def prefill_inputtoken(state, prefill_way):#为了处理有可以复制的上一行token
+            nonlocal flag_begin
+            frame_number = (state.cur_len - text_len) // 257 # 判断处于哪一帧
             if prefill_way in ["base"]:
                 return SampleState(
                     cur_len=state.cur_len,
@@ -644,8 +633,19 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 multi_token_init_scheme='repeat_vertical' #初始化方案, horizon or vertical
                 prefill_num = text_len + (img_width * img_width + 1) * frame_number #判断非此帧的token数量有多少
                 # multi_token_init_scheme='random' #初始化方案, horizon or vertical
+                acceptance_length = state.acceptance_length
+                acceptance_length = jax.lax.cond(#第一次触碰到第一行
+                    jnp.logical_and( ~flag_begin, (state.cur_len-prefill_num >= img_width)),
+                    lambda: rand_token_num+1,
+                    lambda: acceptance_length
+                )
+                flag_begin = jax.lax.cond(
+                    state.cur_len-prefill_num >= img_width,
+                    lambda: True,
+                    lambda: False
+                )
                 running_token, running_probs = get_multi_token_for_preparation(rand_token_num=rand_token_num,
-                                                                                acceptance_length=state.acceptance_length,
+                                                                                acceptance_length=acceptance_length,
                                                                                 input_ids=state.running_token,
                                                                                 input_probs=state.running_probs,
                                                                                 candidate_ids=state.candidate_sequences,
@@ -725,8 +725,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             next_token = jax.random.categorical(prng_key, logits, axis=-1)[None] # (1, 1 + rand_token_num)
             # 2. Verify & Accept prng_key是随机数
             next_token_probs = jax.nn.softmax(logits, axis=-1)[None]
-            acceptance_length, matched_next_tokens, unmatched_next_tokens, \
-            matched_next_probs, unmatched_next_probs = prefix_matching_next_tokens(
+            acceptance_length, matched_next_tokens, running_next_tokens, \
+            matched_next_probs, running_next_probs = prefix_matching_next_tokens(
                     input_tokens=state.running_token[:1,-rand_token_num-1:],
                     input_probs = state.running_probs[:,-rand_token_num-1:],
                     next_tokens=next_token,
@@ -739,7 +739,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             
             # 3. Update and Judge stop signal: Split with 8192
             start_position = state.cur_len - initial_len + 1
-            positon_indices = jnp.arange(0, max_length, dtype=jnp.int32)
+            positon_indices = jnp.arange(0, max_length+rand_token_num*2, dtype=jnp.int32)
             position_check = jax.lax.dynamic_slice(positon_indices, (start_position,), (matched_next_tokens.shape[1],)) % 257
             
             # TODO: bug 可疑点, 要检查是否是索引出现了问题
@@ -748,31 +748,30 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 lambda: matched_next_tokens.at[:, position_check.argmin()].set(8192),
                 lambda: matched_next_tokens
             )
+            running_next_tokens = jax.lax.cond(
+                position_check.min() == 0,
+                lambda: running_next_tokens.at[:, position_check.argmin()].set(8192),
+                lambda: running_next_tokens
+            )
             next_token = jnp.concatenate([matched_next_tokens, matched_next_tokens], axis=0)
-            unmatched_next_tokens = jnp.concatenate([unmatched_next_tokens, unmatched_next_tokens], axis=0)
+            running_next_tokens = jnp.concatenate([running_next_tokens, running_next_tokens], axis=0)
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id).max()
 
-            # Update 接受的token相关attribute dynamic_update_slice如果index超限,则会出现混乱的bug
-            next_sequences,next_candidate_sequences,next_candidate_probs = jax.lax.cond(
-                state.cur_len + next_token.shape[1] - 1 <  max_length,
-                lambda: limit_update_result(state,next_token,matched_next_probs),
-                lambda: dynamic_update_result(state,next_token,matched_next_probs,max_length)
-            )
+            next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
+            next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
+            next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
 
             next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs, state.cur_len, rand_token_num, acceptance_length)
 
             if isinstance(acceptance_length, int):
                 acceptance_length = jnp.array(acceptance_length)
             acceptance_length_list = lax.dynamic_update_slice(state.acceptance_length_list, acceptance_length[None], (state.cur_len,))
-            # FIXME
-            # assert judge_token_sequence(next_sequences,sequences_label,state.cur_len + acceptance_length,id=fid),f"Wrong in {state.cur_len}"
-            # FIXME
             return SampleState(
                 cur_len=state.cur_len + acceptance_length,
                 sequences=next_sequences,
-                running_token=unmatched_next_tokens,
-                running_probs=unmatched_next_probs,
+                running_token=running_next_tokens,
+                running_probs=running_next_probs,
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
                 prng_key=prng_key_next,
@@ -791,7 +790,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         else:
             state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
 
-        sequences_result = jnp.concatenate([state.sequences[:1], state.acceptance_length_list[None]], axis=0)
+        sequences_result = jnp.concatenate([state.sequences[:1, :max_length], state.acceptance_length_list[:max_length][None]], axis=0)
         return FlaxSampleOutput(sequences=sequences_result)
 
     def generate_vision(

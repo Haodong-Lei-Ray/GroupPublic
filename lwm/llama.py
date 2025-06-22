@@ -30,7 +30,7 @@ from tux import function_args_to_config, load_pickle, open_file,  with_sharding_
 from ringattention import ringattention, blockwise_feedforward, ringattention_jax, ringattention_inference
 
 from lwm.sjd import limit_update_kvcahce, dynamic_update_kvcahce
-
+import copy
 
 LLAMA_STANDARD_CONFIGS = {
     '200m': {
@@ -484,15 +484,9 @@ class FlaxLLaMAAttention(nn.Module):
                 )
                 key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
             else:
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0) # indices -> (0, Traced<ShapedArray(int32[]):JaxprTrace(level=1/0)>, 0, 0)
-                #BUG
-                key, value = jax.lax.cond(
-                    cur_index + key.shape[1] - 1 < cached_key.value.shape[1],
-                    lambda: limit_update_kvcahce(cached_key.value, key, cached_value.value, value, indices),
-                    lambda: dynamic_update_kvcahce(cached_key.value, key, cached_value.value, value, indices),
-                )
-                # key = lax.dynamic_update_slice(cached_key.value, key, indices)#BUG
-                # value = lax.dynamic_update_slice(cached_value.value, value, indices)#BUG
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)#BUG
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)#BUG
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
