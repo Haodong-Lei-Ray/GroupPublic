@@ -190,16 +190,6 @@ def get_update_window_token_FSJD(
     
     return input_ids, input_probs
 
-def update_candidate(candidate_sequences, candidate_probs, input_ids, text_len, img_vocab_size):
-    # 更新candidate_sequences
-    vision_token_ids = input_ids[:,text_len:]
-    candidate_sequences = lax.dynamic_update_slice(candidate_sequences, vision_token_ids, (0, text_len))
-    # 更新出对应的概率分布
-    vision_token_probs = jnp.zeros((1, vision_token_ids.shape[-1], img_vocab_size), dtype=jnp.float32)
-    vision_token_probs = vision_token_probs.at[:, jnp.arange(vision_token_ids.shape[-1]), vision_token_ids[:1]].set(1.0)
-    candidate_probs = lax.dynamic_update_slice(candidate_probs, vision_token_probs, (0, text_len, 0))
-    return candidate_sequences, candidate_probs
-
 # Verify
 import jax
 import jax.numpy as jnp
@@ -355,7 +345,6 @@ class SpeculativeSampler:
                     )
 
                 # 2. 进行推测性采样
-                # sampled_draft_prob = 1#BUG
                 next_tokens_i, next_probs_i, \
                 rejected_index_list_i, key_i= jax.lax.cond(
                     r < jnp.minimum(sampled_target_prob / sampled_draft_prob, 1.0),#BUG: 可能弄反了
@@ -474,84 +463,6 @@ def get_random_pairs(data,len=100):
     return random.sample(data, len)
 
 #NOTE: 为了控制载入不超限
-
-def limit_update_result(state,next_token,matched_next_probs):
-    next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-    next_candidate_sequences = lax.dynamic_update_slice(state.candidate_sequences, next_token, (0, state.cur_len))
-    next_candidate_probs = lax.dynamic_update_slice(state.candidate_probs, matched_next_probs, (0, state.cur_len, 0))
-    return next_sequences,next_candidate_sequences,next_candidate_probs
-
-def dynamic_update_result(state, next_token, matched_next_probs, max_length):
-    next_sequences, next_candidate_sequences, next_candidate_probs = (
-        state.sequences,
-        state.candidate_sequences,
-        state.candidate_probs,
-    )
-
-    def update_choose(i, A):
-        next_sequences, next_candidate_sequences, next_candidate_probs = A
-
-        def replace(next_sequences, next_candidate_sequences, next_candidate_probs):
-            j = i - state.cur_len
-            next_sequences = jax.lax.dynamic_update_slice(
-                next_sequences, next_token[:, j][:,None], (0, i)
-            )
-            next_candidate_sequences = jax.lax.dynamic_update_slice(
-                next_candidate_sequences, next_token[:, j][:,None], (0, i)
-            )
-            next_candidate_probs = jax.lax.dynamic_update_slice(
-                next_candidate_probs,
-                matched_next_probs[:, j][:,None,:],
-                (0, i, 0),
-            )
-            return next_sequences, next_candidate_sequences, next_candidate_probs
-
-        def keep(next_sequences, next_candidate_sequences, next_candidate_probs):
-            return next_sequences, next_candidate_sequences, next_candidate_probs
-
-        next_sequences, next_candidate_sequences, next_candidate_probs = jax.lax.cond(
-            i < max_length,
-            lambda: replace(next_sequences, next_candidate_sequences, next_candidate_probs),
-            lambda: keep(next_sequences, next_candidate_sequences, next_candidate_probs),
-        )
-        return next_sequences, next_candidate_sequences, next_candidate_probs
-
-    next_sequences, next_candidate_sequences, next_candidate_probs = jax.lax.fori_loop(
-        state.cur_len,
-        state.cur_len + next_token.shape[1],
-        update_choose,
-        (next_sequences, next_candidate_sequences, next_candidate_probs),
-    )
-    return next_sequences, next_candidate_sequences, next_candidate_probs
-
-def limit_update_kvcahce(cached_key_value, key, cached_value_value, value, indices):
-    key = lax.dynamic_update_slice(cached_key_value, key, indices)#BUG
-    value = lax.dynamic_update_slice(cached_value_value, value, indices)#BUG
-    return key, value
-
-def dynamic_update_kvcahce(cached_key_value, key, cached_value_value, value, indices):
-    def update_choose(i,A):
-        cached_key_value, cached_value_value = A
-        def replace(cached_key_value, cached_value_value):
-            j = i - indices[1]
-            cached_key_value = lax.dynamic_update_slice(cached_key_value, key[:, j][:,None,...], (0, i, 0, 0))
-            cached_value_value = lax.dynamic_update_slice(cached_value_value, value[:, j][:,None,...], (0, i, 0, 0))
-            return cached_key_value, cached_value_value
-        def keep(cached_key_value, cached_value_value):
-            return cached_key_value, cached_value_value
-        cached_key_value, cached_value_value = jax.lax.cond(
-            i >= cached_key_value.shape[0],
-            lambda: keep(cached_key_value, cached_value_value),
-            lambda: replace(cached_key_value, cached_value_value)
-        )
-        return cached_key_value, cached_value_value
-    cached_key_value, cached_value_value = jax.lax.fori_loop(
-        indices[1],
-        key.shape[1]+indices[1],
-        update_choose,
-        (cached_key_value, cached_value_value),
-    )
-    return cached_key_value, cached_value_value
 
 #NOTE: DEBUG
 

@@ -29,7 +29,6 @@ from ml_collections import ConfigDict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh
 from ringattention import ringattention, blockwise_feedforward, ringattention_jax, ringattention_inference
 
-from lwm.sjd import limit_update_kvcahce, dynamic_update_kvcahce
 import copy
 
 LLAMA_STANDARD_CONFIGS = {

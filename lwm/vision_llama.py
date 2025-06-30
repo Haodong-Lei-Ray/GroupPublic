@@ -21,7 +21,7 @@ from tux import load_pickle, open_file
 from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
 import numpy as np
 from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, get_update_window_token_FSJD, init_array
-from lwm.sjd import limit_update_result,dynamic_update_result,update_candidate
+
 from lwm.sjd import judge_token_sequence
 import pickle
 import os
