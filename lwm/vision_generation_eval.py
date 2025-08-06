@@ -48,7 +48,9 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     prefill_way="line", # line frame base
     benchmark_path="/data/lei/dataset/MSRVTT", 
     eval_len=2,
-    benchmark_way="order"
+    benchmark_way="order",
+    # LANTERN
+    nearest_latents_path="/home/leihaodong/AAAI25/ckpt/LWM-Chat-1M-Jax/top_8191_indices.npy"
 )
 def calculate_mean_nonzero(combined_array):
     # 提取非零元素
@@ -115,6 +117,7 @@ def main(argv):
             seed=FLAGS.seed,
             _do_init=False,
             dtype=get_float_dtype_by_name(FLAGS.dtype),
+            nearest_latents_path = FLAGS.nearest_latents_path # For LANTERN
         )
         model_ps = match_partition_rules(
             VideoLLaMAConfig.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), params
@@ -235,6 +238,7 @@ def main(argv):
         img_enc, img, acceptance_length_list, st = generate_first_frame(prompts, max_input_length=128)
         time_list_first.append(st)
         first_acceptance_length_list.append(acceptance_length_list)
+        print(f"accl {acceptance_length_list} time {st}")
         image_encodings.extend(img_enc)
         images.extend(img)
 
@@ -304,6 +308,7 @@ def main(argv):
         video_code, video, acceptance_length_list, st = generate_video_pred(prompts, images, max_input_length=128)
         time_list_later.append(st)
         later_acceptance_length_list.append(acceptance_length_list)
+        print(f"accl {acceptance_length_list} time {st}")
         videos.extend(video)
         video_encodings.append(video_code)
 

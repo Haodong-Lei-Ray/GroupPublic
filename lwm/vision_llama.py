@@ -155,8 +155,12 @@ class FlaxVideoLLaMAPreTrainedModel(FlaxPreTrainedModel):
         _do_init: bool = True,
         **kwargs,
     ):
+        nearest_latents_path = kwargs.pop("nearest_latents_path",None)
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        if nearest_latents_path != None:
+            print(f"Loading nearest_latents from {nearest_latents_path}")
+            self.nearest_latents = np.load(nearest_latents_path).astype(np.int64)
 
     def init_cache(self, batch_size, max_length):
         # init input variables to retrieve cache
@@ -606,10 +610,12 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             candidate_probs=candidate_probs,
         )
 
-        if prefix_token_sampler_scheme == 'sjd':
+        if prefix_token_sampler_scheme in ['sjd', 'lantern', 'lantern_plus', 'relax_sjd']:
             prefix_token_sampler = SpeculativeSampler(
                 generator=prng_key,  # 假设 self.generator 已是一个 JAX PRNGKey
                 sampling_last_draft_token=jnp.zeros(1),  # 使用 jnp.zeros，并移除多余的逗号
+                sampler_way = prefix_token_sampler_scheme,
+                nearest_latents = self.nearest_latents
             )
         elif prefix_token_sampler_scheme == 'jd':
             prefix_token_sampler = None

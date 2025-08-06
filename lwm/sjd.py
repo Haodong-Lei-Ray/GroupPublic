@@ -211,12 +211,14 @@ def init_array(len, img_vocab_size):
 class SpeculativeSampler:
     def __init__(
         self,
+        sampler_way,
         collected_draft_logits: List[jnp.ndarray] = None,
         collected_advanced_logits: List[jnp.ndarray] = None,
         max_num_collected_logits: int = 2,
         generator: Optional[random.PRNGKey] = None,
         draft_type: str = 'jacobian_states',
         sampling_last_draft_token: Optional[jnp.ndarray] = None,
+        nearest_latents: Optional[jnp.ndarray] = None,
     ):
         # self.max_num_collected_logits = max_num_collected_logits
         # self.collected_draft_logits = collected_draft_logits if collected_draft_logits is not None else []
@@ -226,6 +228,8 @@ class SpeculativeSampler:
         self.next_token_index_selector = (lambda x: x - 1) if draft_type == 'jacobian_states' else lambda x: x
 
         self.generator = generator if generator is not None else random.PRNGKey(0)
+        self.nearest_latents = nearest_latents
+        self.sampler_way = sampler_way
         # self.image_token_list = jnp.arange(4, 8196)
 
     def get_reject_sampling_logits(self, token_advanced_prob: jnp.ndarray, token_draft_prob: jnp.ndarray) -> jnp.ndarray:
@@ -344,10 +348,67 @@ class SpeculativeSampler:
                         key_i
                     )
 
+                target_p = sampled_target_prob
+                if self.sampler_way in ["lantern","lantern_plus"]:
+                    lantern_k = 10
+                    image_token_offset = 0
+                    lantern_delta = 0.5
+                    nearest_latents = jnp.array(self.nearest_latents)
+                    same_class_prob = 0
+
+                    search_space = lantern_k
+                    nearest_indices = nearest_latents[cls_idx - image_token_offset] + image_token_offset  # Shape: (batch_size, seq_len, k)
+                    nearest_indices = nearest_indices[:search_space]  # Limit search space
+                    # Zero out invalid positions
+                    nearest_probs = next_prob[b, target_token_index, nearest_indices]
+
+                    # Compute cumulative sum of nearest probabilities
+                    cumsum_nearest_probs = jnp.cumsum(nearest_probs, axis=-1)  # Shape: (batch_size, seq_len, search_space)
+
+                    # 更新 px
+                    if self.sampler_way in ["lantern"]:
+                        # 使用 jax.lax.cond 来实现条件分支
+                        for i in range(cumsum_nearest_probs.shape[0]):
+                            if lantern_delta <= 1.0:
+                                same_class_prob = jnp.where(
+                                    same_class_prob <= lantern_delta,
+                                    cumsum_nearest_probs[i],
+                                    same_class_prob
+                                )
+                            else:
+                                same_class_prob = jnp.where(
+                                    same_class_prob <= (lantern_delta - 1) * target_p,
+                                    cumsum_nearest_probs[i],
+                                    same_class_prob
+                                )
+                        target_p = target_p + same_class_prob
+                        acp = target_p / sampled_draft_prob
+                    elif self.sampler_way in ["lantern_plus"]:
+                        nearest_draft_probs = draft_prob[b, target_token_index, nearest_indices]
+                        qp_probs = nearest_probs / nearest_draft_probs
+                        # Compute cumulative sum of nearest probabilities
+                        cumsum_nearest_probs = jnp.cumsum(qp_probs, axis=-1)  # Shape: (batch_size, seq_len, search_space)
+                        # 使用 jax.lax.cond 来实现条件分支
+                        for i in range(cumsum_nearest_probs.shape[0]):
+                            if lantern_delta <= 1.0:
+                                same_class_prob = jnp.where(
+                                    same_class_prob <= lantern_delta,
+                                    cumsum_nearest_probs[i],
+                                    same_class_prob
+                                )
+                            else:
+                                same_class_prob = jnp.where(
+                                    same_class_prob <= (lantern_delta - 1) * target_p,
+                                    cumsum_nearest_probs[i],
+                                    same_class_prob
+                                )
+                        acp = target_p / sampled_draft_prob + same_class_prob
+                else:
+                    acp = target_p / sampled_draft_prob
                 # 2. 进行推测性采样
                 next_tokens_i, next_probs_i, \
                 rejected_index_list_i, key_i= jax.lax.cond(
-                    r < jnp.minimum(sampled_target_prob / sampled_draft_prob, 1.0),#BUG: 可能弄反了
+                    r < jnp.minimum(acp, 1.0),#BUG: 可能弄反了
                     accept_fn,
                     reject_fn,
                     key_i

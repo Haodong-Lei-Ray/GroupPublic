@@ -49,12 +49,24 @@ class VQGAN:
             )
         return partial(self._wrap_fn(fn), params=self.params)
     
+    @cached_property
+    def _return_codebook(self):
+        def fn(pixel_values, params):
+            return self.model.apply(
+                {'params': params},
+                pixel_values,
+                method=self.model.return_codebook
+            )
+        return partial(self._wrap_fn(fn), params=self.params)
+    
     def encode(self, pixel_values):
         return self._encode(pixel_values)
     
     def decode(self, encoding):
         return self._decode(encoding)
     
+    def return_codebook(self, pixel_values):
+        return self._return_codebook(pixel_values)
 
 class VQGANConfig(PretrainedConfig):
     model_type = "vqgan"
@@ -139,7 +151,10 @@ class VQGANModel(nn.Module):
         if T is not None:
             reconstructed_pixel_values = reconstructed_pixel_values.reshape(-1, T, *reconstructed_pixel_values.shape[1:])
         return jnp.clip(reconstructed_pixel_values, -1, 1)
-    
+
+    def return_codebook(self, encoding):
+        return self.quantize(None, encoding)
+
     def __call__(self, pixel_values):
         encoding = self.encode(pixel_values)[1]
         recon = self.decode(encoding)
