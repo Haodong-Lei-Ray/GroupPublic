@@ -62,6 +62,54 @@ def calculate_mean_nonzero(combined_array):
     return mean_non_zero
 
 def main(argv):
+    # ++++++++++++++++++++++++++Save_result++++++++++++++++++++++++++
+    file_out_path = FLAGS.output_file
+    os.makedirs(file_out_path, exist_ok=True)
+    file_out_video_path = os.path.join(file_out_path, 'video')
+    os.makedirs(file_out_video_path, exist_ok=True)
+    
+    video_name = []
+    # ++++++++++++++++++++++++++Benchmark_init++++++++++++++++++++++++++
+    if FLAGS.prompt == 'MSRVTT':
+        import csv
+        data,prompts = [],[]
+        csvfile = f"{FLAGS.benchmark_path}/MSRVTT_JSFUSION_test.csv"
+        with open(csvfile, "r") as csvfile:
+            reader = csv.reader(csvfile)
+            for row in reader:
+                data.append(row)
+        if FLAGS.benchmark_way == 'random':
+            data = get_random_pairs(data[1:],len=FLAGS.eval_len)
+        else:
+            data = get_order_pairs(data[1:],len=FLAGS.eval_len)
+        for i, row in enumerate(data):
+            prompts.append(row[-1])
+            video_name.append(row[-2])
+    elif "webvid-10M" in FLAGS.prompt:
+        data = load_dataset("TempoFunk/webvid-10M",split='validation')
+        if FLAGS.benchmark_way == 'random':
+            data = data.shuffle()
+        data=data[:FLAGS.eval_len]
+        prompts = data['name']
+        video_name = data['videoid']
+    else:
+        prompts = [FLAGS.prompt]
+    # ++++++++++++++++++++++++++check same++++++++++++++++++++++++++
+    # print(len(prompts))
+    # prompts1 = prompts
+    # video_name1 = video_name
+    # prompts = []
+    # video_name = []
+    # folder_files = os.listdir(file_out_video_path)
+    # for i,j in zip(video_name1,prompts1):
+    #     i_name = str(i) + '.mp4'
+    #     if i_name in folder_files:
+    #         print(f"文件 {i_name} 存在于文件夹 {file_out_video_path}")
+    #         count += 1
+    #     else:
+    #         video_name.append(i)
+    #         prompts.append(j)
+    # ++++++++++++++++++++++++++Gen++++++++++++++++++++++++++
     assert FLAGS.output_file != ''
 
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
@@ -192,32 +240,7 @@ def main(argv):
         return output, image, acceptance_length_list, st
 
     sharded_rng = next_rng()
-    video_name = []
-    # ++++++++++++++++++++++++++Benchmark_init++++++++++++++++++++++++++
-    if FLAGS.prompt == 'MSRVTT':
-        import csv
-        data,prompts = [],[]
-        csvfile = f"{FLAGS.benchmark_path}/MSRVTT_JSFUSION_test.csv"
-        with open(csvfile, "r") as csvfile:
-            reader = csv.reader(csvfile)
-            for row in reader:
-                data.append(row)
-        if FLAGS.benchmark_way == 'random':
-            data = get_random_pairs(data[1:],len=FLAGS.eval_len)
-        else:
-            data = get_order_pairs(data[1:],len=FLAGS.eval_len)
-        for i, row in enumerate(data):
-            prompts.append(row[-1])
-            video_name.append(row[-2])
-    elif "webvid-10M" in FLAGS.prompt:
-        data = load_dataset("TempoFunk/webvid-10M",split='validation')
-        if FLAGS.benchmark_way == 'random':
-            data = data.shuffle()
-        data=data[:FLAGS.eval_len]
-        prompts = data['name']
-        video_name = data['videoid']
-    else:
-        prompts = [FLAGS.prompt]
+    # ++++++++++++++++++++++++++Gen++++++++++++++++++++++++++
     entries = []
     for prompt in prompts:
         entries.append({
@@ -238,7 +261,7 @@ def main(argv):
         img_enc, img, acceptance_length_list, st = generate_first_frame(prompts, max_input_length=128)
         time_list_first.append(st)
         first_acceptance_length_list.append(acceptance_length_list)
-        print(f"accl {acceptance_length_list} time {st}")
+        print(f"accl {np.mean(acceptance_length_list)} time {st}")
         image_encodings.extend(img_enc)
         images.extend(img)
 
@@ -308,17 +331,13 @@ def main(argv):
         video_code, video, acceptance_length_list, st = generate_video_pred(prompts, images, max_input_length=128)
         time_list_later.append(st)
         later_acceptance_length_list.append(acceptance_length_list)
-        print(f"accl {acceptance_length_list} time {st}")
+        print(f"accl {np.mean(acceptance_length_list)} time {st}")
         videos.extend(video)
         video_encodings.append(video_code)
 
     # ++++++++++++++++++++++++++Save_result++++++++++++++++++++++++++
     import json
     all_acceptance_length_list = []
-    file_out_path = FLAGS.output_file
-    file_out_video_path = os.path.join(file_out_path, 'video')
-    os.makedirs(file_out_path, exist_ok=True)
-    os.makedirs(file_out_video_path, exist_ok=True)
     # Config save
     with open(os.path.join(file_out_path,"llama_config.json"), 'w') as f:
         json.dump(llama_config.to_dict(), f, indent=4)
@@ -339,8 +358,9 @@ def main(argv):
         all_acceptance_length_list.append(ACCL_list)
         
         mean_accl_i = calculate_mean_nonzero(all_acceptance_length_list[i])
+        video_name_i = video_name[i] if len(video_name)>i else i
         new_entry = {
-            "video_name": video_name[i],
+            "video_name": video_name_i,
             "prompt": entries[i]['caption'],
             "times": time_i,
             "acc_l": mean_accl_i,

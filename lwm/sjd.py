@@ -2,8 +2,10 @@ import jax.numpy as jnp
 import jax.nn as jnn
 import jax
 import jax.lax as lax
+import time
+from jax import random
 
-def random_multinomial_sample_from_logits(rand_logits, prng_key):
+def random_multinomial_sample_from_logits(rand_logits):
     logits = rand_logits
     # 保存原始形状
     probs_shape = None
@@ -22,7 +24,7 @@ def random_multinomial_sample_from_logits(rand_logits, prng_key):
     probs = jnn.softmax(logits, axis=-1)
 
     # 采样 token（尽管 top-k=1 使采样确定性）
-    rand_tokens = jax.random.categorical(prng_key, logits, axis=-1)
+    rand_tokens = jax.random.categorical(random.split(random.PRNGKey(int(time.time()*1000)))[0], logits, axis=-1)
 
     # 恢复形状
     if probs_shape is not None:
@@ -193,7 +195,6 @@ def get_update_window_token_FSJD(
 # Verify
 import jax
 import jax.numpy as jnp
-from jax import random
 from typing import List, Callable, Optional, Tuple
 
 def init_array(len, img_vocab_size):
@@ -215,7 +216,6 @@ class SpeculativeSampler:
         collected_draft_logits: List[jnp.ndarray] = None,
         collected_advanced_logits: List[jnp.ndarray] = None,
         max_num_collected_logits: int = 2,
-        generator: Optional[random.PRNGKey] = None,
         draft_type: str = 'jacobian_states',
         sampling_last_draft_token: Optional[jnp.ndarray] = None,
         nearest_latents: Optional[jnp.ndarray] = None,
@@ -227,7 +227,6 @@ class SpeculativeSampler:
         self.draft_token_index_selector = lambda x: x
         self.next_token_index_selector = (lambda x: x - 1) if draft_type == 'jacobian_states' else lambda x: x
 
-        self.generator = generator if generator is not None else random.PRNGKey(0)
         self.nearest_latents = nearest_latents
         self.sampler_way = sampler_way
         # self.image_token_list = jnp.arange(4, 8196)
@@ -243,33 +242,19 @@ class SpeculativeSampler:
         token_draft_prob: jnp.ndarray,
         logits_processor: Optional[Callable] = None,
         logits_warper: Optional[Callable] = None,
-        all_collected_input_ids: Optional[jnp.ndarray] = None,
-        key: Optional[jnp.ndarray] = None,
+        state: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """对单个 token 进行拒绝采样"""
-        pos_delta_logits = self.get_reject_sampling_logits(token_next_prob, token_draft_prob)
-        shape_pos_delta_logits = pos_delta_logits.shape
-
-        if logits_processor is not None or logits_warper is not None:
-            # 确保输入形状正确
-            while len(all_collected_input_ids.shape) < 2:
-                all_collected_input_ids = jnp.expand_dims(all_collected_input_ids, axis=0)
-            while len(pos_delta_logits.shape) < 2:
-                pos_delta_logits = jnp.expand_dims(pos_delta_logits, axis=0)
-
-        if logits_processor is not None and len(logits_processor) != 0:
-            pos_delta_logits = logits_processor(all_collected_input_ids, pos_delta_logits, 1)
-
-        if logits_warper is not None:# 1是用来填充的,没啥用
-            pos_delta_logits = logits_warper(all_collected_input_ids, pos_delta_logits, cur_len=1)
-
-        pos_delta_logits = pos_delta_logits.reshape(shape_pos_delta_logits)
+        pos_delta_logits = self.get_reject_sampling_logits(token_next_prob, token_draft_prob)[None]
         probs = jax.nn.softmax(pos_delta_logits, axis=-1)
-        resampled_scores = probs
-
-        probs = jnp.atleast_2d(probs)
-        key, subkey = random.split(key if key is not None else self.generator)
-        resampled_tokens = random.categorical(subkey, jnp.log(probs), axis=-1)
+        # apply min_length, ...
+        pos_delta_logits = logits_processor(state.sequences, pos_delta_logits, state.cur_len)
+        # apply top_p, top_k, temperature
+        pos_delta_logits = logits_warper(pos_delta_logits, pos_delta_logits, state.cur_len)
+        resampled_scores = probs[0]
+        
+        r_key = random.split(random.PRNGKey(int(time.time()*1000)))[0]
+        resampled_tokens = random.categorical(r_key, pos_delta_logits, axis=-1)
         resampled_tokens = resampled_tokens.squeeze(-1)
 
         return resampled_tokens, resampled_scores
@@ -282,8 +267,7 @@ class SpeculativeSampler:
         next_prob: jnp.ndarray,
         logits_processor: Optional[Callable] = None,
         logits_warper: Optional[Callable] = None,
-        all_collected_input_ids: Optional[jnp.ndarray] = None,
-        key: Optional[jnp.ndarray] = None,
+        state: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # """主调用函数，执行推测采样"""
         # draft_tokens: [B, L], advanced_tokens: [B, L], draft_prob: [B, L, V], advanced_prob: [B, L, V]
@@ -292,9 +276,6 @@ class SpeculativeSampler:
         assert len(draft_tokens.shape) == 2 and len(draft_prob.shape) == 3
 
         B, L = draft_tokens.shape
-        key = key if key is not None else self.generator
-        key, subkey = random.split(key)
-        rs = random.uniform(subkey, next_prob.shape)
         draft_token_index_selector = self.draft_token_index_selector
         next_token_index_selector = self.next_token_index_selector
 
@@ -304,49 +285,70 @@ class SpeculativeSampler:
         rejected_index_list = jnp.full((B,L), L, dtype=jnp.int32)
 
         def process_batch(b, b_carry):
-            next_tokens_b, next_probs_b, rejected_index_list_b, key_b = b_carry
+            next_tokens_b, next_probs_b, rejected_index_list_b = b_carry
+            sample_flag = True
 
             # misaligned_idx 记录着last的拒绝的index, 一开始预期全部接受到最后一个位置
             def line_spective_sample(i, i_carry):
-                next_tokens_i, next_probs_i, rejected_index_list_i, key_i = i_carry
+                next_tokens_i, next_probs_i, rejected_index_list_i, sample_flag = i_carry
                 draft_token_index = draft_token_index_selector(i)
                 target_token_index = next_token_index_selector(i)
                 cls_idx = draft_tokens[b, draft_token_index]
                 # 1. 获得当前索引的概率
                 sampled_target_prob = next_prob[b, target_token_index, cls_idx]
                 sampled_draft_prob = draft_prob[b, draft_token_index, cls_idx]
-                r = rs[b, i, cls_idx]
-                def accept_fn(key_i):
+                # r = rs[b, i, cls_idx]
+                r = random.uniform(random.split(random.PRNGKey(int(time.time()*1000)))[0], shape=())  # 生成一个标量随机数
+                def accept_fn(flag):
                     # 2.1 如果接受, last的拒绝的index不变
-                    return (
-                        next_tokens_i.at[b, target_token_index].set(cls_idx),
-                        next_probs_i.at[b, target_token_index].set(draft_prob[b, draft_token_index]),
-                        rejected_index_list_i,
-                        key_i
+                    R = jax.lax.cond(
+                        flag,
+                        lambda: (
+                            next_tokens_i.at[b, target_token_index].set(cls_idx),
+                            next_probs_i.at[b, target_token_index].set(draft_prob[b, draft_token_index]),
+                            rejected_index_list_i,
+                            flag
+                        ),
+                        lambda: (
+                            next_tokens_i,
+                            next_probs_i,
+                            rejected_index_list_i,
+                            flag
+                        ),
                     )
-                def reject_fn(key_i):
+                    return R
+                def reject_fn(flag):
                     # 此外还有重新采样
-                    key_i, subkey = random.split(key_i)
-                    # all_collected_input_ids = jnp.concatenate([
-                    #         all_collected_input_ids[b],
-                    #         next_tokens_i[b, :target_token_index]
-                    #     ], axis=-1)
-                    all_collected_input_ids = jnp.empty((1,2,0), dtype=jnp.int32) # TODO:all_collected_input_ids 不会被用上, 没必要
                     resampled_tokens, resampled_scores = self.reject_sampling_single_token(
                         token_next_prob=next_prob[b, target_token_index],
                         token_draft_prob=draft_prob[b, draft_token_index],
                         logits_processor=logits_processor,
                         logits_warper=logits_warper,
-                        all_collected_input_ids=all_collected_input_ids,
-                        key=subkey
+                        state=state
                     )
+                    R = jax.lax.cond(
+                        flag,
+                        lambda: (
+                            next_tokens_i.at[b, target_token_index].set(resampled_tokens),
+                            next_probs_i.at[b, target_token_index].set(resampled_scores),
+                            rejected_index_list_i.at[b,i].set(i),#如果拒绝, last的拒绝的index更新
+                            False
+                        ),
+                        lambda: (
+                            next_tokens_i,
+                            next_probs_i,
+                            rejected_index_list_i,
+                            flag
+                        ),
+                    )
+                    return R
 
-                    return (
-                        next_tokens_i.at[b, target_token_index].set(resampled_tokens),
-                        next_probs_i.at[b, target_token_index].set(resampled_scores),
-                        rejected_index_list_i.at[b,i].set(i),#如果拒绝, last的拒绝的index更新
-                        key_i
-                    )
+                    # return (
+                    #     next_tokens_i.at[b, target_token_index].set(resampled_tokens),
+                    #     next_probs_i.at[b, target_token_index].set(resampled_scores),
+                    #     rejected_index_list_i.at[b,i].set(i),#如果拒绝, last的拒绝的index更新
+                    #     False
+                    # )
 
                 target_p = sampled_target_prob
                 if self.sampler_way in ["lantern","lantern_plus"]:
@@ -407,25 +409,25 @@ class SpeculativeSampler:
                     acp = target_p / sampled_draft_prob
                 # 2. 进行推测性采样
                 next_tokens_i, next_probs_i, \
-                rejected_index_list_i, key_i= jax.lax.cond(
-                    r < jnp.minimum(acp, 1.0),#BUG: 可能弄反了
+                rejected_index_list_i, sample_flag = jax.lax.cond(
+                    r < jnp.minimum(acp, 1.0),
                     accept_fn,
                     reject_fn,
-                    key_i
+                    sample_flag
                 )
 
-                return next_tokens_i, next_probs_i, rejected_index_list_i, key_i
+                return next_tokens_i, next_probs_i, rejected_index_list_i, sample_flag
             
             # rejected_idx是会改变的, 每个point都会改变, 所以要更新
             next_tokens_b, next_probs_b, \
-            rejected_index_list_b, key_b = jax.lax.fori_loop(
-                1, L, line_spective_sample, (next_tokens_b, next_probs_b, rejected_index_list_b, key_b)
+            rejected_index_list_b, sample_flag = jax.lax.fori_loop(
+                1, L, line_spective_sample, (next_tokens_b, next_probs_b, rejected_index_list_b, sample_flag)
             )
-            return next_tokens_b, next_probs_b, rejected_index_list_b, key_b
+            return next_tokens_b, next_probs_b, rejected_index_list_b
 
         # 更新的有: new token,new prob, new rejected index, key 保证了每个Line有同样的随机性, 平行验证
-        resampled_next_tokens, resampled_next_scores, rejected_index_list, _ = jax.lax.fori_loop(
-            0, B, process_batch, (resampled_next_tokens, resampled_next_scores, rejected_index_list, key)
+        resampled_next_tokens, resampled_next_scores, rejected_index_list = jax.lax.fori_loop(
+            0, B, process_batch, (resampled_next_tokens, resampled_next_scores, rejected_index_list)
         )
 
         # 一定是 [L-1, ...] 全都接受不会改变最小值L-1, 第一个被拒绝的就是那个应该被索引的地方. 为树状结构埋下伏笔 max_rejected_idx=(1,...,L-1), 若都接受, 则为L

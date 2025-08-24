@@ -22,7 +22,8 @@ from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollect
 import numpy as np
 from lwm.sjd import prefix_matching_next_tokens, SpeculativeSampler, get_multi_token_for_preparation, get_update_window_token_FSJD, init_array
 
-from lwm.sjd import judge_token_sequence
+from jax import random
+import time
 import pickle
 import os
 
@@ -36,7 +37,6 @@ class SampleState:
     running_token: jnp.ndarray
     running_probs: jnp.ndarray
     is_sent_finished: jnp.ndarray
-    prng_key: jnp.ndarray
     model_kwargs: Dict[str, jnp.ndarray]
     acceptance_length_list: jnp.ndarray
     acceptance_length: jnp.ndarray = jnp.array(1)
@@ -529,7 +529,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
         input_ids = input_ids.astype(jnp.int32)
@@ -602,7 +601,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             running_token=input_ids,
             running_probs=input_probs,
             is_sent_finished=is_sent_finished,
-            prng_key=prng_key,
             model_kwargs=model_kwargs,
             acceptance_length=jnp.array(1),
             acceptance_length_list = acceptance_length_list,
@@ -612,7 +610,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
 
         if prefix_token_sampler_scheme in ['sjd', 'lantern', 'lantern_plus', 'relax_sjd']:
             prefix_token_sampler = SpeculativeSampler(
-                generator=prng_key,  # 假设 self.generator 已是一个 JAX PRNGKey
                 sampling_last_draft_token=jnp.zeros(1),  # 使用 jnp.zeros，并移除多余的逗号
                 sampler_way = prefix_token_sampler_scheme,
                 nearest_latents = self.nearest_latents
@@ -632,7 +629,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     running_token=state.running_token,
                     is_sent_finished=state.is_sent_finished,
                     model_kwargs=state.model_kwargs,
-                    prng_key=state.prng_key,
                 )
             elif prefill_way in ["line"]:
                 multi_token_init_scheme='repeat_horizon' #初始化方案, horizon or vertical
@@ -667,7 +663,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     running_probs=running_probs,
                     sequences=state.sequences,
                     is_sent_finished=state.is_sent_finished,
-                    prng_key=state.prng_key,
                     candidate_sequences = state.candidate_sequences,
                     candidate_probs = state.candidate_probs,
                     acceptance_length_list = state.acceptance_length_list,
@@ -692,7 +687,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     running_probs=running_probs,
                     sequences=state.sequences,
                     is_sent_finished=state.is_sent_finished,
-                    prng_key=state.prng_key,
                     candidate_sequences = state.candidate_sequences,
                     candidate_probs = state.candidate_probs,
                     acceptance_length_list = state.acceptance_length_list,
@@ -711,7 +705,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
 
         def sample_search_body_fn(state):
             """state update fn."""
-            prng_key, prng_key_next = jax.random.split(state.prng_key)
             # 1. Phase: prefill token in it.
             state = prefill_inputtoken(state, prefill_way = prefill_way)
             model_outputs = model(state.running_token, params=params, **state.model_kwargs)
@@ -728,7 +721,7 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
             # apply top_p, top_k, temperature
             logits = logits_warper(logits, logits, state.cur_len)
 
-            next_token = jax.random.categorical(prng_key, logits, axis=-1)[None] # (1, 1 + rand_token_num)
+            next_token = jax.random.categorical(random.split(random.PRNGKey(int(time.time()*1000)))[0], logits, axis=-1)[None] # (1, 1 + rand_token_num)
             # 2. Verify & Accept prng_key是随机数
             next_token_probs = jax.nn.softmax(logits, axis=-1)[None]
             acceptance_length, matched_next_tokens, running_next_tokens, \
@@ -739,8 +732,8 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                     next_probs=next_token_probs,
                     logits_processor = logits_processor, 
                     logits_warper = logits_warper,
-                    all_collected_input_ids = state.sequences,
-                    prefix_token_sampler = prefix_token_sampler
+                    prefix_token_sampler = prefix_token_sampler,
+                    state = state
                 )
             
             # 3. Update and Judge stop signal: Split with 8192
@@ -780,7 +773,6 @@ class FlaxVideoLLaMAForCausalLM(FlaxVideoLLaMAPreTrainedModel):
                 running_probs=running_next_probs,
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
-                prng_key=prng_key_next,
                 candidate_sequences = next_candidate_sequences,
                 candidate_probs = next_candidate_probs,
                 acceptance_length = acceptance_length,
